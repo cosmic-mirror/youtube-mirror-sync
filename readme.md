@@ -40,7 +40,7 @@ brew install python ffmpeg node
 
 1. **Clone or Download the Repository:**
    ```bash
-   git clone https://github.com/spactable/youtube-mirror-sync.git
+   git clone https://github.com/cosmic-mirror/youtube-mirror-sync.git
    cd youtube-mirror-sync
    chmod +x *.command
    ```
