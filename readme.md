@@ -16,7 +16,7 @@ Unlike basic downloaders, `youtube-mirror-sync` is architected for long-term lib
 6. **Frictionless Setup:** Double-click to run. No dealing with Python environments, Conda conflicts, or "externally managed environment" errors. It just works.
 
 ### Under the Hood (For Nerds)
-To achieve this level of reliability, `yt-mirror-sync` utilizes several advanced software patterns:
+To achieve this level of reliability, `youtube-mirror-sync` utilizes several advanced software patterns:
 * **File-Hash Identification:** Uses SHA-256 hashing to track files rather than relying on rigid, fragile file paths.
 * **Embedded Fingerprints:** Writes the YouTube Video ID directly into the MP3's `ISRC` ID3 tag for database reconstruction.
 * **Circuit Breaker & Exponential Backoff:** Failed downloads are logged, and retry wait times double exponentially to prevent infinite hang-ups on dead links.
@@ -40,8 +40,8 @@ brew install python ffmpeg node
 
 1. **Clone or Download the Repository:**
    ```bash
-   git clone https://github.com/YOUR-USERNAME/yt-mirror-sync.git
-   cd yt-mirror-sync
+   git clone https://github.com/spactable/youtube-mirror-sync.git
+   cd youtube-mirror-sync
    chmod +x *.command
    ```
 
