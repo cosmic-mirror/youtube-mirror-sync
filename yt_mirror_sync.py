@@ -214,6 +214,12 @@ class DatabaseManager:
         cur = self._conn.cursor()
         cur.execute("UPDATE playlists SET music_app_persistent_id = ? WHERE id = ?", (persistent_id, playlist_id))
         self._conn.commit()
+
+    def update_playlist_name(self, playlist_id: int, new_name: str):
+        """Updates the local database name of a playlist."""
+        cur = self._conn.cursor()
+        cur.execute("UPDATE playlists SET name = ? WHERE id = ?", (new_name, playlist_id))
+        self._conn.commit()
         
     def reset_all_persistent_ids(self):
         """Sets all persistent IDs to NULL. Used after a library rebuild."""
@@ -320,6 +326,9 @@ class MusicAppClient:
                 end if
                 if foundPlaylist is missing value then
                     set foundPlaylist to make new user playlist with properties {name:playlistName}
+                else
+                    -- Enforce name update in case it was renamed in the script
+                    set name of foundPlaylist to playlistName
                 end if
                 delete every track of foundPlaylist
                 if (count of trackPaths) > 0 then
@@ -864,12 +873,13 @@ class ConsoleUI:
             '1': ('List Playlists', self._handle_list_playlists),
             '2': ('Add Playlist', self._handle_add_playlist),
             '3': ('Show Playlist Details', self._handle_show_details),
-            '4': ('Update a Playlist', self._handle_update_one),
-            '5': ('Update All Playlists', self._handle_update_all),
-            '6': ('Remove a Playlist', self._handle_remove_playlist),
-            '7': ('Clean Music Library (Remove Dead Tracks)', self.orchestrator.music_app.clean_dead_tracks),
-            '8': ('Rebuild Music App Library (Recovery Tool)', self._handle_rebuild_library),
-            '9': ('Reset Playlist Link (Fix Duplicates)', self._handle_reset_link),
+            '4': ('Rename a Playlist', self._handle_rename_playlist),
+            '5': ('Sync a Playlist', self._handle_update_one),
+            '6': ('Sync All Playlists', self._handle_update_all),
+            '7': ('Remove a Playlist', self._handle_remove_playlist),
+            '8': ('Clean Music Library (Remove Dead Tracks)', self.orchestrator.music_app.clean_dead_tracks),
+            '9': ('Rebuild Music App Library (Recovery Tool)', self._handle_rebuild_library),
+            '10': ('Reset Playlist Link (Fix Duplicates)', self._handle_reset_link),
             '0': ('Exit', lambda: sys.exit(0))
         }
 
@@ -883,7 +893,7 @@ class ConsoleUI:
         
         while True:
             print("\n--- Main Menu ---")
-            sorted_items = sorted(self.menu.items(), key=lambda item: 10 if item[0] == '0' else int(item[0]))
+            sorted_items = sorted(self.menu.items(), key=lambda item: 99 if item[0] == '0' else int(item[0]))
             for key, (desc, _) in sorted_items:
                 print(f"  {key}. {desc}")
             
@@ -930,6 +940,37 @@ class ConsoleUI:
         archive_path.touch()
         self.db.add_playlist(name, url, str(archive_path), self.cfg.DEFAULT_DELETE_ON_REMOVED)
         print(f'Added playlist "{name}"')
+
+    def _handle_rename_playlist(self):
+        self._handle_list_playlists()
+        pid = self._get_id_from_user("Enter playlist ID to rename: ")
+        if pid is None: return
+        
+        playlist = self.db.get_playlist_details(pid)
+        if not playlist:
+            print(f"Playlist with ID {pid} not found.", file=sys.stderr); return
+
+        print(f"Fetching current title from YouTube for '{playlist['url']}'...")
+        suggested_title = self.yt.fetch_playlist_title(playlist['url'])
+        
+        prompt = f"New name for '{playlist['name']}'"
+        if suggested_title: prompt += f" [press Enter to use: '{suggested_title}']"
+        
+        name = input(f"{prompt}: ").strip()
+        
+        if not name and suggested_title: 
+            name = suggested_title
+        elif not name: 
+            print("Operation cancelled. Name cannot be empty unless using a suggestion.")
+            return
+            
+        if name == playlist['name']:
+            print("Name is unchanged.")
+            return
+
+        self.db.update_playlist_name(pid, name)
+        print(f"Renamed playlist to '{name}'.")
+        print(" -> Note: The playlist in Apple Music will automatically update its name during the next sync.")
 
     def _handle_show_details(self):
         self._handle_list_playlists()
