@@ -120,7 +120,7 @@ class Config:
 # ---------------------------------------------------------------------
 
 class DatabaseManager:
-    """Manages all persistence logic for the SQLite database."""
+    """Manages all persistence logic for the SQLite database, using Context Managers for atomicity."""
     def __init__(self, db_path: Path):
         self.db_path = db_path
         self._conn = sqlite3.connect(str(db_path))
@@ -129,32 +129,31 @@ class DatabaseManager:
         self._initialize()
 
     def _initialize(self):
-        cur = self._conn.cursor()
-        # Existing tables
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS playlists (
-            id INTEGER PRIMARY KEY, name TEXT, url TEXT UNIQUE, archive_path TEXT,
-            delete_on_removed INTEGER DEFAULT 1, created_at TEXT,
-            music_app_persistent_id TEXT)''')
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS videos (
-            video_id TEXT PRIMARY KEY, title TEXT, file_hash TEXT, added_at TEXT)''')
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS playlist_videos (
-            playlist_id INTEGER, video_id TEXT,
-            FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
-            FOREIGN KEY(video_id) REFERENCES videos(video_id) ON DELETE CASCADE,
-            PRIMARY KEY (playlist_id, video_id))''')
-        
-        # --- NEW: Circuit Breaker Table ---
-        cur.execute('''
-        CREATE TABLE IF NOT EXISTS download_failures (
-            video_id TEXT PRIMARY KEY,
-            failure_count INTEGER DEFAULT 1,
-            last_attempt_at TEXT,
-            error_reason TEXT
-        )''')
-        self._conn.commit()
+        with self._conn:
+            # Existing tables
+            self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS playlists (
+                id INTEGER PRIMARY KEY, name TEXT, url TEXT UNIQUE, archive_path TEXT,
+                delete_on_removed INTEGER DEFAULT 1, created_at TEXT,
+                music_app_persistent_id TEXT)''')
+            self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS videos (
+                video_id TEXT PRIMARY KEY, title TEXT, file_hash TEXT, added_at TEXT)''')
+            self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS playlist_videos (
+                playlist_id INTEGER, video_id TEXT,
+                FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
+                FOREIGN KEY(video_id) REFERENCES videos(video_id) ON DELETE CASCADE,
+                PRIMARY KEY (playlist_id, video_id))''')
+            # Circuit Breaker Table
+            self._conn.execute('''
+            CREATE TABLE IF NOT EXISTS download_failures (
+                video_id TEXT PRIMARY KEY,
+                failure_count INTEGER DEFAULT 1,
+                last_attempt_at TEXT,
+                error_reason TEXT)''')
+
+    # --- READ OPERATIONS (No commit needed) ---
 
     def get_all_playlists_with_counts(self) -> List[sqlite3.Row]:
         cur = self._conn.cursor()
@@ -180,54 +179,6 @@ class DatabaseManager:
         row = cur.fetchone()
         return row['file_hash'] if row else None
 
-    def add_playlist(self, name: str, url: str, archive_path: str, delete_on_removed: bool) -> None:
-        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-        cur = self._conn.cursor()
-        cur.execute('INSERT INTO playlists (name, url, archive_path, delete_on_removed, created_at, music_app_persistent_id) VALUES (?, ?, ?, ?, ?, ?)',
-                    (name, url, archive_path, int(delete_on_removed), now, None))
-        self._conn.commit()
-
-    def remove_playlist(self, playlist_id: int):
-        cur = self._conn.cursor()
-        cur.execute('DELETE FROM playlists WHERE id = ?', (playlist_id,))
-        self._conn.commit()
-
-    def insert_or_replace_video(self, video_id: str, title: str, file_hash: str) -> None:
-        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-        cur = self._conn.cursor()
-        cur.execute('INSERT OR REPLACE INTO videos (video_id, title, file_hash, added_at) VALUES (?, ?, ?, ?)',
-                    (video_id, title, file_hash, now))
-        self._conn.commit()
-    
-    def link_video_to_playlist(self, playlist_id: int, video_id: str):
-        cur = self._conn.cursor()
-        cur.execute('INSERT OR IGNORE INTO playlist_videos (playlist_id, video_id) VALUES (?, ?)', (playlist_id, video_id))
-        self._conn.commit()
-
-    def unlink_videos_from_playlist(self, playlist_id: int, video_ids: set):
-        cur = self._conn.cursor()
-        cur.executemany('DELETE FROM playlist_videos WHERE playlist_id = ? AND video_id = ?', 
-                        [(playlist_id, vid) for vid in video_ids])
-        self._conn.commit()
-
-    def update_playlist_persistent_id(self, playlist_id: int, persistent_id: Optional[str]):
-        cur = self._conn.cursor()
-        cur.execute("UPDATE playlists SET music_app_persistent_id = ? WHERE id = ?", (persistent_id, playlist_id))
-        self._conn.commit()
-
-    def update_playlist_name(self, playlist_id: int, new_name: str):
-        """Updates the local database name of a playlist."""
-        cur = self._conn.cursor()
-        cur.execute("UPDATE playlists SET name = ? WHERE id = ?", (new_name, playlist_id))
-        self._conn.commit()
-        
-    def reset_all_persistent_ids(self):
-        """Sets all persistent IDs to NULL. Used after a library rebuild."""
-        cur = self._conn.cursor()
-        cur.execute("UPDATE playlists SET music_app_persistent_id = NULL")
-        self._conn.commit()
-        print("  -> All playlist links in the internal database have been reset.")
-
     def get_orphaned_videos(self) -> List[sqlite3.Row]:
         cur = self._conn.cursor()
         cur.execute('''
@@ -237,55 +188,86 @@ class DatabaseManager:
         ''')
         return cur.fetchall()
 
-    def delete_video_record(self, video_id: str):
-        cur = self._conn.cursor()
-        cur.execute('DELETE FROM videos WHERE video_id = ?', (video_id,))
-        self._conn.commit()
-
-    # --- NEW: Circuit Breaker Methods ---
-
     def get_failure_status(self, video_id: str) -> Optional[sqlite3.Row]:
-        """Retrieves failure history for a video."""
         cur = self._conn.cursor()
         cur.execute('SELECT failure_count, last_attempt_at FROM download_failures WHERE video_id = ?', (video_id,))
         return cur.fetchone()
 
-    def record_failure(self, video_id: str, reason: str = ""):
-        """
-        Records a failed download attempt.
-        Implements Exponential Backoff by incrementing the failure count.
-        """
+    # --- WRITE OPERATIONS (Context Managed) ---
+
+    def add_playlist(self, name: str, url: str, archive_path: str, delete_on_removed: bool) -> None:
         now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-        cur = self._conn.cursor()
+        with self._conn:
+            self._conn.execute('''
+                INSERT INTO playlists (name, url, archive_path, delete_on_removed, created_at, music_app_persistent_id) 
+                VALUES (?, ?, ?, ?, ?, ?)''',
+                (name, url, archive_path, int(delete_on_removed), now, None))
+
+    def remove_playlist(self, playlist_id: int):
+        with self._conn:
+            self._conn.execute('DELETE FROM playlists WHERE id = ?', (playlist_id,))
+
+    def insert_or_replace_video(self, video_id: str, title: str, file_hash: str) -> None:
+        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        with self._conn:
+            self._conn.execute('''
+                INSERT INTO videos (video_id, title, file_hash, added_at) 
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET 
+                    title = excluded.title, 
+                    file_hash = excluded.file_hash
+            ''', (video_id, title, file_hash, now))
+    
+    def link_video_to_playlist(self, playlist_id: int, video_id: str):
+        with self._conn:
+            self._conn.execute('INSERT OR IGNORE INTO playlist_videos (playlist_id, video_id) VALUES (?, ?)', (playlist_id, video_id))
+
+    def unlink_videos_from_playlist(self, playlist_id: int, video_ids: set):
+        with self._conn:
+            self._conn.executemany('DELETE FROM playlist_videos WHERE playlist_id = ? AND video_id = ?', 
+                                   [(playlist_id, vid) for vid in video_ids])
+
+    def update_playlist_persistent_id(self, playlist_id: int, persistent_id: Optional[str]):
+        with self._conn:
+            self._conn.execute("UPDATE playlists SET music_app_persistent_id = ? WHERE id = ?", (persistent_id, playlist_id))
+
+    def update_playlist_name(self, playlist_id: int, new_name: str):
+        with self._conn:
+            self._conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (new_name, playlist_id))
         
-        # Check if it already exists
-        cur.execute('SELECT failure_count FROM download_failures WHERE video_id = ?', (video_id,))
-        row = cur.fetchone()
-        
-        if row:
-            new_count = row['failure_count'] + 1
-            cur.execute('''
-                UPDATE download_failures 
-                SET failure_count = ?, last_attempt_at = ?, error_reason = ? 
-                WHERE video_id = ?
-            ''', (new_count, now, reason, video_id))
-        else:
-            cur.execute('''
-                INSERT INTO download_failures (video_id, failure_count, last_attempt_at, error_reason)
-                VALUES (?, 1, ?, ?)
-            ''', (video_id, now, reason))
-        
-        self._conn.commit()
+    def reset_all_persistent_ids(self):
+        with self._conn:
+            self._conn.execute("UPDATE playlists SET music_app_persistent_id = NULL")
+        print("  -> All playlist links in the internal database have been reset.")
+
+    def delete_video_record(self, video_id: str):
+        with self._conn:
+            self._conn.execute('DELETE FROM videos WHERE video_id = ?', (video_id,))
+
+    def record_failure(self, video_id: str, reason: str = ""):
+        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        row = self.get_failure_status(video_id)
+        with self._conn:
+            if row:
+                self._conn.execute('''
+                    UPDATE download_failures 
+                    SET failure_count = ?, last_attempt_at = ?, error_reason = ? 
+                    WHERE video_id = ?
+                ''', (row['failure_count'] + 1, now, reason, video_id))
+            else:
+                self._conn.execute('''
+                    INSERT INTO download_failures (video_id, failure_count, last_attempt_at, error_reason)
+                    VALUES (?, 1, ?, ?)
+                ''', (video_id, now, reason))
 
     def clear_failure(self, video_id: str):
-        """Resets the circuit breaker when a download succeeds."""
-        cur = self._conn.cursor()
-        cur.execute('DELETE FROM download_failures WHERE video_id = ?', (video_id,))
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute('DELETE FROM download_failures WHERE video_id = ?', (video_id,))
         
     def close(self):
         if self._conn:
             self._conn.close()
+
 
 class MusicAppClient:
     """A client for interacting with the macOS Music application via AppleScript."""
@@ -366,8 +348,12 @@ class MusicAppClient:
         stable_checks = 0
         max_stable_checks = 3 # Number of times the count must be stable before we trust it
         
-        while True:
+        max_retries = 60 # 60 attempts * 5 seconds = 5 minutes maximum wait time
+        attempts = 0
+        
+        while attempts < max_retries:
             time.sleep(5)
+            attempts += 1
             current_track_count = self.get_library_track_count()
             
             if current_track_count < 0:
@@ -385,9 +371,11 @@ class MusicAppClient:
             # Exit condition: The count is at or above our target AND it has been stable.
             if current_track_count >= target_count and stable_checks >= max_stable_checks:
                 print("   - Music.app appears to have finished importing.")
-                break
+                return
             
             last_track_count = current_track_count
+            
+        print("   -> Warning: Music.app import wait timed out. Proceeding anyway to prevent hanging.", file=sys.stderr)
 
     def clean_dead_tracks(self):
         """Asks the Music app to find and remove references to deleted files."""
@@ -498,11 +486,35 @@ class YouTubeClient:
 # ---------------------------------------------------------------------
 
 class LibraryScanner:
-    """Scans the music library on disk and provides an in-memory cache of file hashes."""
+    """Scans the music library on disk and provides an in-memory cache of file hashes.
+    Uses an internal SQLite database to avoid recalculating hashes for unchanged files."""
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.media_folder = cfg.MUSIC_LIBRARY_ROOT / 'Music'
+        
         self.hash_cache: Dict[str, Path] = {}
+        self.isrc_cache: Dict[str, Path] = {}
+        self.path_to_hash: Dict[Path, str] = {}
+        
+        self.cache_db_path = cfg.APP_DIR / 'scanner_cache.db'
+        self._init_db()
+
+    def _init_db(self):
+        with sqlite3.connect(str(self.cache_db_path)) as conn:
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS file_cache (
+                    file_path TEXT PRIMARY KEY,
+                    mtime REAL,
+                    size INTEGER,
+                    file_hash TEXT,
+                    isrc TEXT
+                )
+            ''')
+            # Safe schema migration for the existing cache DB
+            try:
+                conn.execute("ALTER TABLE file_cache ADD COLUMN isrc TEXT")
+            except sqlite3.OperationalError:
+                pass 
 
     def _calculate_file_hash(self, file_path: Path) -> Optional[str]:
         sha256 = hashlib.sha256()
@@ -514,27 +526,90 @@ class LibraryScanner:
         except (IOError, OSError):
             return None
 
+    def _get_isrc(self, file_path: Path) -> Optional[str]:
+        try:
+            audio = EasyID3(file_path)
+            return audio.get('isrc', [''])[0]
+        except Exception:
+            return None
+
     def scan(self, force_rescan: bool = False):
-        """Builds the hash -> file_path map. Caches the result for the run."""
         if self.hash_cache and not force_rescan:
             return
         
-        print("Scanning music library to build file fingerprints...")
+        print("Scanning music library to build file fingerprints (using fast cache)...")
         self.hash_cache.clear()
-        if self.media_folder.exists():
-            for file_path in self.media_folder.rglob(f'*.{self.cfg.AUDIO_FORMAT}'):
+        self.isrc_cache.clear()
+        self.path_to_hash.clear()
+        
+        if not self.media_folder.exists():
+            return
+
+        db_cache = {}
+        with sqlite3.connect(str(self.cache_db_path)) as conn:
+            for row in conn.execute('SELECT file_path, mtime, size, file_hash, isrc FROM file_cache'):
+                db_cache[row[0]] = (row[1], row[2], row[3], row[4])
+
+        updates = []
+        current_files = set()
+        
+        for file_path in self.media_folder.rglob(f'*.{self.cfg.AUDIO_FORMAT}'):
+            path_str = str(file_path)
+            current_files.add(path_str)
+            
+            try:
+                stat = file_path.stat()
+                mtime = stat.st_mtime
+                size = stat.st_size
+            except OSError:
+                continue 
+                
+            cached = db_cache.get(path_str)
+            
+            # --- THE FIX: ISRC BACKFILL ---
+            if cached and cached[0] == mtime and cached[1] == size:
+                file_hash, isrc = cached[2], cached[3]
+                
+                # If the cache is valid but ISRC is NULL (from our previous migration), read it!
+                if not isrc:
+                    isrc = self._get_isrc(file_path)
+                    if isrc:
+                        updates.append((path_str, mtime, size, file_hash, isrc))
+            # ------------------------------
+            else:
                 file_hash = self._calculate_file_hash(file_path)
+                isrc = self._get_isrc(file_path)
                 if file_hash:
-                    self.hash_cache[file_hash] = file_path
-        print(f"  -> Found {len(self.hash_cache)} existing music files.")
+                    updates.append((path_str, mtime, size, file_hash, isrc))
+            
+            if file_hash:
+                self.hash_cache[file_hash] = file_path
+                self.path_to_hash[file_path] = file_hash
+            if isrc:
+                self.isrc_cache[isrc] = file_path
+                
+        if updates or len(current_files) != len(db_cache):
+            with sqlite3.connect(str(self.cache_db_path)) as conn:
+                if updates:
+                    conn.executemany('''
+                        INSERT OR REPLACE INTO file_cache (file_path, mtime, size, file_hash, isrc)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', updates)
+                deleted_files = set(db_cache.keys()) - current_files
+                if deleted_files:
+                    conn.executemany('DELETE FROM file_cache WHERE file_path = ?', [(f,) for f in deleted_files])
+                                     
+        print(f"  -> Found {len(self.hash_cache)} music files (calculated {len(updates)} new/modified).")
     
     def get_path_for_hash(self, file_hash: str) -> Optional[Path]:
         return self.hash_cache.get(file_hash)
 
+    def get_path_for_isrc(self, isrc: str) -> Optional[Path]:
+        return self.isrc_cache.get(isrc)
+
 class SyncOrchestrator:
     """The 'brains' of the application. Orchestrates the entire sync process."""
     
-    # Backoff Configuration
     BACKOFF_BASE_SECONDS = 86400  # 1 Day
     BACKOFF_MAX_SECONDS = 2592000 # 30 Days
 
@@ -586,85 +661,54 @@ class SyncOrchestrator:
             with open(archive_path, 'r') as f: lines = f.readlines()
             updated_lines = [line for line in lines if video_id not in line.split()]
             if len(lines) != len(updated_lines):
-                # print(f"  -> Resetting download record for '{video_id}' to allow re-download.")
                 with open(archive_path, 'w') as f: f.writelines(updated_lines)
         except Exception as e:
             print(f"  -> Warning: Could not modify archive file {archive_path}: {e}", file=sys.stderr)
 
     def _is_cooling_down(self, video_id: str) -> bool:
-        """
-        Checks if a video is in a 'cool-down' period due to previous failures.
-        Returns True if we should SKIP this video.
-        """
         row = self.db.get_failure_status(video_id)
-        if not row:
-            return False
-
+        if not row: return False
         failures = row['failure_count']
         last_attempt_str = row['last_attempt_at']
-        
         try:
-            # Parse UTC string '2023-01-01T12:00:00Z'
             last_attempt = datetime.datetime.strptime(last_attempt_str, "%Y-%m-%dT%H:%M:%SZ")
-        except ValueError:
-            return False # Date format error? Safe to retry.
+        except ValueError: return False 
 
-        # Exponential Backoff Formula
-        # Delay = Base * (2 ^ (failures - 1))
         exponent = max(0, failures - 1)
-        delay_seconds = self.BACKOFF_BASE_SECONDS * (2 ** exponent)
-        
-        # Cap the delay
-        delay_seconds = min(delay_seconds, self.BACKOFF_MAX_SECONDS)
-        
+        delay_seconds = min(self.BACKOFF_BASE_SECONDS * (2 ** exponent), self.BACKOFF_MAX_SECONDS)
         next_retry = last_attempt + datetime.timedelta(seconds=delay_seconds)
         now = datetime.datetime.utcnow()
         
         if now < next_retry:
             wait_time = next_retry - now
-            
-            # Smart time formatting
-            if wait_time.days > 0:
-                time_str = f"{wait_time.days} day(s)"
-            elif wait_time.seconds >= 3600:
-                time_str = f"{wait_time.seconds // 3600} hour(s)"
-            else:
-                time_str = f"{wait_time.seconds // 60} minute(s)"
-
+            time_str = f"{wait_time.days} day(s)" if wait_time.days > 0 else f"{wait_time.seconds // 3600} hour(s)" if wait_time.seconds >= 3600 else f"{wait_time.seconds // 60} minute(s)"
             print(f"  -> Skipping '{video_id}' (Circuit Open). Failures: {failures}. Next retry in {time_str}.")
             return True
-            
         return False
 
     def adopt_untracked_files(self):
-        """Scans library for fingerprinted files not in the DB and "adopts" them."""
         self.scanner.scan()
-        print("Checking for untracked files to adopt...")
+        print("Checking for untracked files to adopt or heal...")
         adopted_count = 0
         
-        isrc_map: Dict[str, Path] = {}
-        if self.scanner.media_folder.exists():
-            for file_path in self.scanner.media_folder.rglob(f'*.{self.cfg.AUDIO_FORMAT}'):
-                try:
-                    audio = EasyID3(file_path)
-                    isrc = audio.get('isrc', [''])[0]
-                    if isrc:
-                        isrc_map[isrc] = file_path
-                except Exception:
-                    continue
-
-        for isrc, file_path in isrc_map.items():
-            if not self.db.get_video_hash(isrc):
-                file_hash = self.scanner._calculate_file_hash(file_path)
+        for isrc, file_path in self.scanner.isrc_cache.items():
+            db_hash = self.db.get_video_hash(isrc)
+            current_hash = self.scanner.path_to_hash.get(file_path)
+            
+            if not current_hash: continue
+            
+            if not db_hash:
                 tags = self._get_tags(file_path)
-                if file_hash:
-                    self.db.insert_or_replace_video(isrc, tags.get('title', 'Unknown Title'), file_hash)
-                    adopted_count += 1
+                self.db.insert_or_replace_video(isrc, tags.get('title', 'Unknown Title'), current_hash)
+                adopted_count += 1
+            elif db_hash != current_hash:
+                tags = self._get_tags(file_path)
+                self.db.insert_or_replace_video(isrc, tags.get('title', 'Unknown Title'), current_hash)
         
         if adopted_count > 0:
-            print(f"  -> Adopted {adopted_count} file(s) into the database from existing metadata.")
+            print(f"  -> Adopted {adopted_count} file(s) into the database.")
         else:
-            print("  -> No new files to adopt.")
+            print("  -> Database maps match file hashes.")
 
     def sync_playlist(self, playlist_id: int):
         self.scanner.scan()
@@ -681,10 +725,7 @@ class SyncOrchestrator:
             if upstream_videos is None:
                 print('  -> Failed to fetch playlist metadata. Aborting sync.', file=sys.stderr); return
 
-            album_name = None
-            if self.cfg.ALBUM_MODE == 'playlist': album_name = playlist['name']
-            elif self.cfg.ALBUM_MODE == 'global': album_name = self.cfg.GLOBAL_ALBUM_NAME
-
+            album_name = playlist['name'] if self.cfg.ALBUM_MODE == 'playlist' else self.cfg.GLOBAL_ALBUM_NAME
             print(f"Step 2/3: Verifying and correcting {len(upstream_videos)} videos...")
             
             for video_data in upstream_videos:
@@ -695,39 +736,44 @@ class SyncOrchestrator:
                 db_hash = self.db.get_video_hash(vid)
                 file_path = self.scanner.get_path_for_hash(db_hash) if db_hash else None
 
+                # --- SELF HEALING LOGIC ---
+                if not file_path:
+                    # Hash lookup failed. Did Apple Music modify the file? Let's check by ISRC!
+                    file_path = self.scanner.get_path_for_isrc(vid)
+                    if file_path:
+                        current_file_hash = self.scanner.path_to_hash.get(file_path)
+                        if current_file_hash:
+                            self.db.insert_or_replace_video(vid, title, current_file_hash)
+                            db_hash = current_file_hash
+                # --------------------------
+
                 current_file_hash = None
                 
-                # CASE 1: File exists locally
                 if file_path and file_path.exists():
                     current_file_hash = db_hash
-                    # Metadata check (optional, but good)
                     current_tags = self._get_tags(file_path)
                     if (current_tags.get('title') != title or
                         current_tags.get('artist') != artist or
                         current_tags.get('isrc') != vid):
                         print(f"Metadata for '{title}' is incorrect, fixing...")
                         self._write_tags_to_file(file_path, vid, title, artist, album_name)
-                
-                # CASE 2: File missing
+                        
+                        # Fix metadata changes file hash. Heal DB immediately to prevent future drops.
+                        new_hash = self.scanner._calculate_file_hash(file_path)
+                        if new_hash:
+                            self.db.insert_or_replace_video(vid, title, new_hash)
+                            current_file_hash = new_hash
+                            self.scanner.hash_cache[new_hash] = file_path
+                            self.scanner.path_to_hash[file_path] = new_hash
                 else:
-                    # CHECK CIRCUIT BREAKER BEFORE DOWNLOADING
-                    if self._is_cooling_down(vid):
-                        # Skip this iteration entirely. 
-                        # We do NOT add it to the playlist for Music.app this run, 
-                        # effectively hiding the broken song until it's fixed.
-                        continue
+                    if self._is_cooling_down(vid): continue
                     
                     print(f"\nFile for '{artist} - {title}' is missing, downloading...")
-                    
-                    # Only remove from archive immediately before we try
                     self._remove_from_archive(vid, Path(playlist['archive_path']))
-                    
                     staged_path = self.yt.download_video(vid, Path(playlist['archive_path']))
                     
                     if staged_path:
-                        # SUCCESS
-                        self.db.clear_failure(vid) # Circuit Reset
-                        
+                        self.db.clear_failure(vid) 
                         self._write_tags_to_file(staged_path, vid, title, artist, album_name)
                         file_hash = self.scanner._calculate_file_hash(staged_path)
                         if file_hash:
@@ -738,8 +784,6 @@ class SyncOrchestrator:
                         else:
                              print(f"  -> FATAL: Could not calculate hash for '{staged_path.name}'.", file=sys.stderr)
                     else:
-                        # FAILURE
-                        # Record the failure so we skip it next time
                         print(f"  -> Download failed. Recording failure for exponential backoff.")
                         self.db.record_failure(vid, reason="Download failed (generic)")
 
@@ -790,12 +834,17 @@ class SyncOrchestrator:
             print("Sync process stopped by user. Finalizing playlist with processed songs...")
             
             if new_files_staged:
-                print(f"\nMoving {len(new_files_staged)} partially downloaded file(s) to Music library...")
+                print(f"\nMoving partially downloaded file(s) to Music library...")
                 count_before = self.music_app.get_library_track_count()
+                moved_count = 0
                 for staged_path, final_filename in new_files_staged:
-                    inbox_path = self.cfg.DEFAULT_TARGET_DIR / final_filename
-                    shutil.move(staged_path, inbox_path)
-                self.music_app.wait_for_import(len(new_files_staged), count_before)
+                    # --- CRASH PROTECTION FIX ---
+                    if staged_path.exists():
+                        inbox_path = self.cfg.DEFAULT_TARGET_DIR / final_filename
+                        shutil.move(staged_path, inbox_path)
+                        moved_count += 1
+                if moved_count > 0:
+                    self.music_app.wait_for_import(moved_count, count_before)
                 self.scanner.scan(force_rescan=True)
 
             file_paths = [str(self.scanner.get_path_for_hash(h)) for h in ordered_hashes_for_playlist if self.scanner.get_path_for_hash(h)]
@@ -808,17 +857,13 @@ class SyncOrchestrator:
 
     def sync_all(self):
         playlists = self.db.get_all_playlists_with_counts()
-        if not playlists:
-            print('No playlists to sync.'); return
-        for p in playlists:
-            self.sync_playlist(p['id'])
+        if not playlists: print('No playlists to sync.'); return
+        for p in playlists: self.sync_playlist(p['id'])
 
     def cleanup_orphaned_files(self):
         self.scanner.scan()
         orphans = self.db.get_orphaned_videos()
-        if not orphans:
-            print("No orphaned videos found in the database to clean up.")
-            return
+        if not orphans: print("No orphaned videos found in the database to clean up."); return
 
         print(f"\nFound {len(orphans)} orphaned video(s) that are no longer in any playlist.")
         files_were_deleted = False
@@ -829,29 +874,21 @@ class SyncOrchestrator:
                     path_to_delete.unlink()
                     print(f"  - Deleted local file for '{orphan['title']}'")
                     files_were_deleted = True
-                except OSError as e:
-                    print(f"  - Error deleting file {path_to_delete}: {e}", file=sys.stderr)
-            else:
-                 print(f"  - Could not find local file for '{orphan['title']}', removing from DB.")
+                except OSError as e: print(f"  - Error deleting file {path_to_delete}: {e}", file=sys.stderr)
+            else: print(f"  - Could not find local file for '{orphan['title']}', removing from DB.")
             self.db.delete_video_record(orphan['video_id'])
-        
-        if files_were_deleted:
-            self.music_app.clean_dead_tracks()
+        if files_were_deleted: self.music_app.clean_dead_tracks()
 
     def rebuild_full_library(self) -> bool:
-        """Orchestrates the entire library rebuild process."""
         media_folder = self.scanner.media_folder
-        
         rebuild_succeeded = self.music_app.rebuild_library(self.cfg.MUSIC_LIBRARY_DB_PATH, media_folder)
         if not rebuild_succeeded:
-            print("\nLibrary rebuild failed. Aborting subsequent sync.", file=sys.stderr)
-            return False
+            print("\nLibrary rebuild failed. Aborting subsequent sync.", file=sys.stderr); return False
 
         print("5. Resetting this script's internal state to match new library...")
         self.db.reset_all_persistent_ids()
         self.scanner.scan(force_rescan=True)
         print("   - Script's file cache and playlist links have been reset.")
-
         print("\nRebuild process complete. Running a full sync to re-link your files and playlists...")
         self.sync_all()
         return True
