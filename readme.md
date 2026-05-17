@@ -46,7 +46,7 @@ brew install python ffmpeg node
 2. **Run the App:**
    Double-click the **`run.command`** file in Finder (or run `./run.command` in terminal). 
    - *First Run:* It will automatically create an isolated Python virtual environment (`.venv`) and install `yt-dlp` and `mutagen`.
-   - You will be greeted by an interactive console menu. Type `2` to **add a YouTube playlist**, then `5` to **sync**.
+   - You will be greeted by an interactive console menu. Type `2` to **add a YouTube playlist**, then `6` to **sync**.
 
 ### macOS Permissions
 
