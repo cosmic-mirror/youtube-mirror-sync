@@ -25,13 +25,17 @@ To achieve this level of reliability, `youtube-mirror-sync` utilizes several adv
 
 ## Prerequisites
 
-You will need **Homebrew** installed on your Mac. Open your terminal and install the required system dependencies:
+You will need **Homebrew** installed on your Mac. Open your terminal to install Conda (via Miniconda), ffmpeg, and node:
 
 ```bash
-brew install python ffmpeg node
-```
-*(Note: `ffmpeg` is required to extract audio, and `node` is used by yt-dlp to bypass certain YouTube bot-protections).*
+# Install Conda (Miniconda), ffmpeg, and node
+brew install --cask miniconda
+brew install ffmpeg node
 
+# Initialize Conda for your shell (run this once, then restart your terminal)
+conda init $(basename $SHELL)
+```
+*(Note: `miniconda` is used to manage your isolated Python environment, `ffmpeg` is required to extract high-quality audio, and `node` is used by yt-dlp to bypass YouTube's anti-bot JavaScript challenges).*
 ---
 
 ## Installation & Usage
