@@ -57,14 +57,6 @@ Because this script automates the Music app and moves local files, macOS will pr
 
 ---
 
-## Keeping Things Updated
-
-YouTube frequently updates its backend, which regularly breaks downloaders. 
-
-If downloads stop working, simply double-click the **`update.command`** file. It will automatically fetch the latest versions of `yt-dlp`, `pip`, and `mutagen` into your isolated environment.
-
----
-
 ## Data Storage
 
 All your script data is stored cleanly inside the `.data/` folder in the project directory:
