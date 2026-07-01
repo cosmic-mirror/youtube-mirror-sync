@@ -27,10 +27,8 @@ import json
 import datetime
 from pathlib import Path
 import textwrap
-import urllib.parse
 import re
 import shutil
-import hashlib
 import time
 from typing import Optional, List, Dict, Tuple
 
@@ -45,6 +43,13 @@ except ImportError:
 # 1. UTILITY FUNCTIONS
 # ---------------------------------------------------------------------
 
+JUNK_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    r'\(official music video\)', r'\[official music video\]', r'\(official video\)',
+    r'\[official video\]', r'\(lyrics\)', r'\[lyrics\]', r'\(lyric video\)',
+    r'\[lyric video\]', r'\(hd\)', r'\[hd\]', r'\(4k\)', r'\[4k\]',
+    r'\(audio\)', r'\[audio\]'
+]]
+
 def _run_command(cmd: List[str], capture_output: bool = True, text: bool = True, check: bool = False) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(cmd, capture_output=capture_output, text=text, check=check)
@@ -53,22 +58,31 @@ def _run_command(cmd: List[str], capture_output: bool = True, text: bool = True,
         sys.exit(127)
 
 def _clean_youtube_title(title: str, artist: str) -> str:
-    pattern = re.compile(f"^{re.escape(artist)}\s*[-–:]\s*", re.IGNORECASE)
-    cleaned_title = pattern.sub('', title)
-    junk_patterns = [
-        r'\(official music video\)', r'\[official music video\]', r'\(official video\)',
-        r'\[official video\]', r'\(lyrics\)', r'\[lyrics\]', r'\(lyric video\)',
-        r'\[lyric video\]', r'\(hd\)', r'\[hd\]', r'\(4k\)', r'\[4k\]',
-        r'\(audio\)', r'\[audio\]'
-    ]
-    for pattern in junk_patterns:
-        cleaned_title = re.sub(pattern, '', cleaned_title, flags=re.IGNORECASE)
-    cleaned_title = re.sub(r'\[\s*\]', '', cleaned_title)
-    cleaned_title = re.sub(r'\(\s*\)', '', cleaned_title)
-    return cleaned_title.strip()
+    if artist:
+        pattern = re.compile(f"^{re.escape(artist)}\\s*[-–:]\\s*", re.IGNORECASE)
+        title = pattern.sub('', title)
+    for pat in JUNK_PATTERNS:
+        title = pat.sub('', title)
+    title = re.sub(r'\[\s*\]|\(\s*\)', '', title)
+    return title.strip()
 
 def _clean_artist_name(artist: str) -> str:
     return re.sub(r'\s-\sTopic$', '', artist, flags=re.IGNORECASE).strip()
+
+def resolve_metadata(raw_title: str, raw_artist: str) -> Tuple[str, str]:
+    artist = raw_artist if raw_artist and raw_artist.lower() != "unknown" else ""
+    title = raw_title
+    
+    # If no valid artist was provided, see if the title contains "Artist - Title"
+    if not artist and " - " in raw_title:
+        parts = raw_title.split(" - ", 1)
+        artist = parts[0].strip()
+        title = parts[1].strip()
+        
+    artist = _clean_artist_name(artist)
+    title = _clean_youtube_title(title, artist)
+    
+    return artist or "Unknown Artist", title or "Unknown Title"
 
 def _sanitize_filename(name: str) -> str:
     sanitized = re.sub(r'[<>:"/\\|?*]', '_', name)
@@ -99,7 +113,7 @@ class Config:
     MUSIC_LIBRARY_ROOT: Path = Path.home() / 'Music/Music/Media.localized'
     MUSIC_LIBRARY_DB_PATH: Path = Path.home() / 'Music/Music/Music Library.musiclibrary'
     
-    ALBUM_MODE: str = 'playlist'
+    ALBUM_MODE: str = 'global'
     GLOBAL_ALBUM_NAME: str = 'YouTube Downloads'
     DEFAULT_DELETE_ON_REMOVED: bool = True
 
@@ -124,7 +138,7 @@ class DatabaseManager:
                 music_app_persistent_id TEXT)''')
             self._conn.execute('''
             CREATE TABLE IF NOT EXISTS videos (
-                video_id TEXT PRIMARY KEY, title TEXT, file_hash TEXT, added_at TEXT)''')
+                video_id TEXT PRIMARY KEY, title TEXT, added_at TEXT)''')
             self._conn.execute('''
             CREATE TABLE IF NOT EXISTS playlist_videos (
                 playlist_id INTEGER, video_id TEXT,
@@ -174,11 +188,14 @@ class DatabaseManager:
         with self._conn:
             self._conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (new_name, playlist_id))
 
-    def insert_or_replace_video(self, video_id: str, title: str):
+    def insert_or_update_video(self, video_id: str, title: str):
         now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
         with self._conn:
-            self._conn.execute('INSERT OR REPLACE INTO videos (video_id, title, file_hash, added_at) VALUES (?, ?, "", ?)',
-                        (video_id, title, now))
+            self._conn.execute('''
+                INSERT INTO videos (video_id, title, added_at) 
+                VALUES (?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET title=excluded.title
+            ''', (video_id, title, now))
     
     def link_video_to_playlist(self, playlist_id: int, video_id: str):
         with self._conn:
@@ -373,9 +390,28 @@ class YouTubeClient:
         proc = _run_command(cmd)
         if proc.returncode != 0 or not proc.stdout: return None
         try:
-            return [{'id': e.get('id'), 'title': e.get('title') or e.get('id'), 'artist': e.get('channel') or 'Unknown'}
-                    for e in json.loads(proc.stdout).get('entries', []) if e.get('id')]
+            entries = json.loads(proc.stdout).get('entries', [])
+            results = []
+            for e in entries:
+                if not e.get('id'):
+                    continue
+                
+                # Defensively search for a valid artist name, skipping generic "Unknown" fallbacks
+                artist = ""
+                for key in ['artist', 'creator', 'channel', 'uploader']:
+                    val = e.get(key)
+                    if val and str(val).strip().lower() not in ['', 'unknown', 'unknown artist', 'unknown uploader']:
+                        artist = str(val).strip()
+                        break
+                
+                results.append({
+                    'id': e['id'],
+                    'title': e.get('title') or e['id'],
+                    'artist': artist
+                })
+            return results
         except (json.JSONDecodeError, AttributeError): return None
+
     
     def fetch_playlist_title(self, url: str) -> Optional[str]:
         cmd = self.base_cmd + ['--flat-playlist', '-J', url]
@@ -433,13 +469,19 @@ class SyncOrchestrator:
         self.cfg = cfg
         self.db = db
         self.music_app = music_app
-        self.yt = yt
+        self.youtube = yt
         self.scanner = scanner
 
     def _get_tags(self, file_path: Path) -> Dict[str, str]:
         try:
             audio = EasyID3(file_path)
-            return {'artist': audio.get('artist', [''])[0], 'title': audio.get('title', [''])[0]}
+            return {
+                'artist': audio.get('artist', [''])[0], 
+                'title': audio.get('title', [''])[0],
+                'album': audio.get('album', [''])[0],
+                'albumartist': audio.get('albumartist', [''])[0],
+                'compilation': audio.get('compilation', [''])[0]
+            }
         except Exception: return {}
 
     def _write_tags_to_file(self, file_path: Path, video_id: str, title: str, artist: str, album: Optional[str]):
@@ -467,7 +509,7 @@ class SyncOrchestrator:
         if not archive_path.exists(): return
         try:
             with open(archive_path, 'r') as f: lines = f.readlines()
-            updated_lines = [line for line in lines if video_id not in line.split()]
+            updated_lines = [line for line in lines if line.strip() != f"youtube {video_id}"]
             if len(lines) != len(updated_lines):
                 with open(archive_path, 'w') as f: f.writelines(updated_lines)
         except Exception as e: pass
@@ -500,22 +542,24 @@ class SyncOrchestrator:
         for isrc, file_path in self.scanner.isrc_cache.items():
             if not self.db.video_exists(isrc):
                 tags = self._get_tags(file_path)
-                self.db.insert_or_replace_video(isrc, tags.get('title', 'Unknown Title'))
+                self.db.insert_or_update_video(isrc, tags.get('title', 'Unknown Title'))
                 adopted_count += 1
         if adopted_count > 0: print(f"  -> Adopted {adopted_count} file(s) into the database.")
         else: print("  -> No new files to adopt.")
 
     def sync_playlist(self, playlist_id: int):
-        self.scanner.scan()
+        self.scanner.scan(force_rescan=True) # Always start fresh in case Apple Music moved files
         playlist = self.db.get_playlist_details(playlist_id)
         if not playlist: return
 
         ordered_vids_for_playlist = []
         new_files_staged = []
+        metadata_updated = False # Track if we changed any tags
+        
         try:
             print(f'\n=== Syncing [{playlist["id"]}] {playlist["name"]} ===')
             print("Step 1/3: Fetching latest video list from YouTube...")
-            upstream_videos = self.yt.fetch_playlist_metadata(playlist['url'])
+            upstream_videos = self.youtube.fetch_playlist_metadata(playlist['url'])
             if upstream_videos is None:
                 print('  -> Failed to fetch playlist metadata. Aborting sync.', file=sys.stderr); return
 
@@ -524,19 +568,37 @@ class SyncOrchestrator:
             print(f"Step 2/3: Verifying and correcting {len(upstream_videos)} videos...")
             
             for video_data in upstream_videos:
-                vid, raw_title, raw_artist = video_data['id'], video_data['title'], video_data['artist']
-                artist = _clean_artist_name(raw_artist)
-                title = _clean_youtube_title(raw_title, artist)
+                vid = video_data['id']
+                artist, title = resolve_metadata(video_data['title'], video_data['artist'])
                 
                 file_path = self.scanner.get_path_for_id(vid)
 
                 # Check if it exists ANYWHERE in the library by its ID
                 if file_path and file_path.exists():
-                    self.db.insert_or_replace_video(vid, title)
+                    self.db.insert_or_update_video(vid, title)
                     current_tags = self._get_tags(file_path)
-                    if current_tags.get('title') != title or current_tags.get('artist') != artist:
-                        print(f"Metadata for '{title}' is incorrect, fixing...")
-                        self._write_tags_to_file(file_path, vid, title, artist, album_name)
+                    
+                    # SAFETY SHIELD: If fast-scan gave us "Unknown Artist", but the file on disk
+                    # already has a valid creator name, protect your disk tags and use them!
+                    final_artist = artist
+                    if artist == "Unknown Artist":
+                        disk_artist = current_tags.get('artist')
+                        if disk_artist and disk_artist.lower() not in ['', 'unknown', 'unknown artist', 'unknown uploader']:
+                            final_artist = disk_artist
+
+                    # Determine what the tags SHOULD be based on your config
+                    expected_album = album_name if album_name else ""
+
+                    # Check if any core tag is out of sync (comparing against our protected final_artist)
+                    needs_update = (
+                        current_tags.get('title') != title or
+                        current_tags.get('artist') != final_artist or
+                        current_tags.get('album') != expected_album
+                    )
+                    
+                    if needs_update:
+                        print(f"Metadata for '{title}' is outdated, fixing...")
+                        self._write_tags_to_file(file_path, vid, title, final_artist, album_name)
                 
                 # File is completely missing
                 else:
@@ -544,12 +606,12 @@ class SyncOrchestrator:
                     
                     print(f"\nFile for '{artist} - {title}' is missing, downloading...")
                     self._remove_from_archive(vid, Path(playlist['archive_path']))
-                    staged_path = self.yt.download_video(vid, Path(playlist['archive_path']))
+                    staged_path = self.youtube.download_video(vid, Path(playlist['archive_path']))
                     
                     if staged_path:
                         self.db.clear_failure(vid)
                         self._write_tags_to_file(staged_path, vid, title, artist, album_name)
-                        self.db.insert_or_replace_video(vid, title)
+                        self.db.insert_or_update_video(vid, title)
                         final_filename = f"{_sanitize_filename(artist)} - {_sanitize_filename(title)}.{self.cfg.AUDIO_FORMAT}"
                         new_files_staged.append((staged_path, final_filename))
                     else:
@@ -567,8 +629,11 @@ class SyncOrchestrator:
                     inbox_path = self.cfg.DEFAULT_TARGET_DIR / final_filename
                     shutil.move(staged_path, inbox_path)
                 self.music_app.wait_for_import(len(new_files_staged), count_before)
-                # Rescan so AppleScript knows where Apple Music moved the new files
                 self.scanner.scan(force_rescan=True)
+            elif metadata_updated:
+                print("\nWaiting for Apple Music to reorganize updated files...")
+                time.sleep(3) # Give Apple Music time to move files
+                self.scanner.scan(force_rescan=True) # Refresh the cache with the new paths!
             
             print("\nStep 3/3: Rebuilding playlist in Music.app to match YouTube order...")
             file_paths = [str(self.scanner.get_path_for_id(vid)) for vid in ordered_vids_for_playlist if self.scanner.get_path_for_id(vid)]
@@ -600,13 +665,14 @@ class SyncOrchestrator:
                 count_before = self.music_app.get_library_track_count()
                 moved_count = 0
                 for staged_path, final_filename in new_files_staged:
-                    # --- CRASH PROTECTION FIX RESTORED ---
                     if staged_path.exists():
                         inbox_path = self.cfg.DEFAULT_TARGET_DIR / final_filename
                         shutil.move(staged_path, inbox_path)
                         moved_count += 1
                 if moved_count > 0:
                     self.music_app.wait_for_import(moved_count, count_before)
+                self.scanner.scan(force_rescan=True)
+            elif metadata_updated:
                 self.scanner.scan(force_rescan=True)
 
             file_paths = [str(self.scanner.get_path_for_id(vid)) for vid in ordered_vids_for_playlist if self.scanner.get_path_for_id(vid)]
@@ -652,13 +718,13 @@ class SyncOrchestrator:
 # ---------------------------------------------------------------------
 
 class ConsoleUI:
-    def __init__(self, cfg: Config, orchestrator: SyncOrchestrator, db: DatabaseManager, yt: YouTubeClient, scanner: LibraryScanner):
-        self.cfg, self.orchestrator, self.db, self.yt, self.scanner = cfg, orchestrator, db, yt, scanner
+    def __init__(self, cfg: Config, orchestrator: SyncOrchestrator, db: DatabaseManager, youtube: YouTubeClient, scanner: LibraryScanner):
+        self.cfg, self.orchestrator, self.db, self.youtube, self.scanner = cfg, orchestrator, db, youtube, scanner
         self.menu = {
             '1': ('List Playlists', self._handle_list_playlists), 
             '2': ('Add Playlist', self._handle_add_playlist),
             '3': ('Show Playlist Details', self._handle_show_details), 
-            '4': ('Rename a Playlist', self._handle_rename_playlist), # RESTORED
+            '4': ('Rename a Playlist', self._handle_rename_playlist), 
             '5': ('Sync a Playlist', self._handle_update_one),
             '6': ('Sync All Playlists', self._handle_update_all), 
             '7': ('Remove a Playlist', self._handle_remove_playlist),
@@ -691,14 +757,13 @@ class ConsoleUI:
     def _handle_add_playlist(self):
         url = input('Playlist URL: ').strip()
         if not url: return
-        suggested_title = self.yt.fetch_playlist_title(url)
+        suggested_title = self.youtube.fetch_playlist_title(url)
         name = input(f"Friendly name [{'press Enter for '+suggested_title if suggested_title else ''}]: ").strip() or suggested_title or "Unnamed Playlist"
         archive_path = self.cfg.ARCHIVES_DIR / f'archive-{_slugify(name)}.txt'
         archive_path.touch()
         self.db.add_playlist(name, url, str(archive_path), self.cfg.DEFAULT_DELETE_ON_REMOVED)
         print(f'Added playlist "{name}"')
 
-    # RESTORED RENAMING FEATURE
     def _handle_rename_playlist(self):
         self._handle_list_playlists()
         pid = self._get_id_from_user("Enter playlist ID to rename: ")
@@ -709,7 +774,7 @@ class ConsoleUI:
             print(f"Playlist with ID {pid} not found.", file=sys.stderr); return
 
         print(f"Fetching current title from YouTube for '{playlist['url']}'...")
-        suggested_title = self.yt.fetch_playlist_title(playlist['url'])
+        suggested_title = self.youtube.fetch_playlist_title(playlist['url'])
         
         prompt = f"New name for '{playlist['name']}'"
         if suggested_title: prompt += f" [press Enter to use: '{suggested_title}']"
@@ -782,7 +847,7 @@ def main():
         db = DatabaseManager(config.DB_PATH)
         orchestrator = SyncOrchestrator(config, db, MusicAppClient(), YouTubeClient(config), LibraryScanner(config))
         orchestrator.adopt_untracked_files()
-        ConsoleUI(config, orchestrator, db, orchestrator.yt, orchestrator.scanner).run()
+        ConsoleUI(config, orchestrator, db, orchestrator.youtube, orchestrator.scanner).run()
     finally:
         if db: db.close()
 
