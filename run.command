@@ -3,44 +3,72 @@ set -euo pipefail
 export LC_ALL=en_US.UTF-8
 
 # -------------------- CONFIG --------------------
+ENV_NAME="yt-mirror-env"
+PY_VERSION="3.10"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/.venv"
-VENV_PYTHON="${VENV_DIR}/bin/python3"
 PYTHON_SCRIPT="${SCRIPT_DIR}/yt_mirror_sync.py"
 # ------------------------------------------------
 
-info()  { echo "\033[1;34m[INFO]\033[0m  $*"; }
-error() { echo "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
+info()  { echo "[INFO]  $*"; }
+error() { echo "[ERROR] $*" >&2; exit 1; }
 
-# 1. Check for system dependencies (macOS standard is Homebrew)
-for cmd in python3 ffmpeg node; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        error "Missing system requirement: '$cmd'.\nPlease install Homebrew (https://brew.sh) and run:\n  brew install python ffmpeg node"
-    fi
-done
+initialize_conda() {
+    if command -v conda >/dev/null 2>&1; then return 0; fi
+    for f in "${HOME}/.zprofile" "${HOME}/.zshenv" "${HOME}/.zshrc"; do
+        if [[ -f "$f" ]]; then source "$f" >/dev/null 2>&1 || true; fi
+    done
+    if command -v conda >/dev/null 2>&1; then return 0; fi
+    local candidates=("${HOME}/miniconda3/etc/profile.d/conda.sh" "${HOME}/anaconda3/etc/profile.d/conda.sh")
+    for c in "${candidates[@]}"; do
+        if [[ -f "$c" ]]; then source "$c" || true; return 0; fi
+    done
+    return 1
+}
 
-# 2. Bootstrap standard Python venv if it doesn't exist
-if [[ ! -d "$VENV_DIR" ]]; then
-    info "First run detected. Setting up isolated Python environment..."
-    
-    # Create the venv using the system's python3
-    python3 -m venv "$VENV_DIR"
-    
-    info "Installing Python dependencies..."
-    # BULLETPROOFING: Call the venv's python directly via absolute path.
-    # This completely bypasses Conda/Homebrew and prevents PEP-668 externally-managed errors.
-    "$VENV_PYTHON" -m pip install --upgrade --quiet pip
-    "$VENV_PYTHON" -m pip install --quiet yt-dlp mutagen
-    
-    info "Setup complete!"
+info "Checking environment and dependencies..."
+
+if ! initialize_conda; then
+    error "Conda not found. Please install Miniconda or Anaconda."
 fi
 
-# 3. Run the application using the isolated Python
+source "$(conda info --base)/etc/profile.d/conda.sh"
+
+manager="conda"
+if command -v mamba >/dev/null 2>&1; then manager="mamba"; fi
+
+# 1. Create the env if it doesn't exist
+if ! conda info --envs | grep -q "^${ENV_NAME}\s"; then
+    info "Creating environment '${ENV_NAME}'..."
+    "$manager" create -y -n "${ENV_NAME}" "python=${PY_VERSION}" -c conda-forge pip
+fi
+
+conda activate "${ENV_NAME}"
+
+# -------------------------------------------------------
+# ASK FOR UPDATES (Default: No)
+# -------------------------------------------------------
+echo
+echo -n "Check for updates (ffmpeg, nodejs, pip packages)? [y/N] "
+read -r response
+
+if [[ "$response" =~ ^[yY] ]]; then
+    # 2. Ensure core dependencies are installed (This fixes the JS/FFmpeg issues)
+    info "Ensuring system dependencies (FFmpeg, Node.js) are present..."
+    "$manager" install --yes --quiet -c conda-forge ffmpeg nodejs
+
+    # 3. Update python packages
+    info "Updating Python packages..."
+    python -m pip install --upgrade --quiet pip yt-dlp mutagen
+else
+    info "Skipping updates."
+fi
+# -------------------------------------------------------
+
+info "Environment ready. Starting sync..."
 echo "--------------------------------------------------"
-"$VENV_PYTHON" "$PYTHON_SCRIPT"
+python "$PYTHON_SCRIPT"
 echo "--------------------------------------------------"
 
-# Keep terminal open if double-clicked from Finder
 if [[ "$(ps -o comm= -p $PPID)" == *Terminal* || "$TERM_PROGRAM" == "Apple_Terminal" ]]; then
     echo
     read -s -k '?Press any key to close...'
