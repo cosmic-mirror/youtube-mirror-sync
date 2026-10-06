@@ -59,10 +59,16 @@ Ensure `run.command` has been run at least once so the environment exists. Then,
 ```zsh
 python3 android_export.py
 ```
-*Or via absolute path:*
+*Or invoke the script directly by its path (example):*
 ```zsh
-python3 "$HOME/Documents/Code_Projects/YT_Playlist/android_export.py"
+"/path/to/your/folder/android_export.py"
 ```
+Example:
+```zsh
+~/Documents/Code_Projects/YT_Playlist/android_export.py
+```
+
+*(If permission is denied on direct execution, run `chmod +x android_export.py` once).*
 *(The script contains built-in environment detection and will automatically route itself through the `yt-mirror-env` Python interpreter if launched outside an active Conda session).*
 
 **Output Locations:**
