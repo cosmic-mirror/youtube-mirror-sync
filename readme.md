@@ -1,10 +1,4 @@
-Here is the refined README with the requested improvements, including a concise explanation on how/why Conda is integrated into your shell for `android_export.py`.
-
----
-
-# YouTube Music Mirror & Android Export
-
-A macOS-only toolset to download YouTube playlists directly into Apple Music, maintain playlist order and metadata via AppleScript, and export organized tracks and `.m3u` playlists for Android/Samsung Music.
+###### A macOS-only toolset to download YouTube playlists directly into Apple Music, maintain playlist order and metadata via AppleScript, and export organized tracks and `.m3u` playlists for Android/Samsung Music.
 
 ---
 
