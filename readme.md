@@ -1,6 +1,6 @@
 ###### A macOS-only toolset to download YouTube playlists directly into Apple Music, maintain playlist order and metadata via AppleScript, and export organized tracks and `.m3u` playlists for Android/Samsung Music.
 
----
+
 
 ## 1. Prerequisites (macOS Only)
 
