@@ -4,7 +4,7 @@ export LC_ALL=en_US.UTF-8
 
 # -------------------- CONFIG --------------------
 ENV_NAME="yt-mirror-env"
-PY_VERSION="3.10"
+PY_VERSION="3.13"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_SCRIPT="${SCRIPT_DIR}/yt_mirror_sync.py"
 # ------------------------------------------------
