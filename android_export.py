@@ -5,16 +5,11 @@ from pathlib import Path
 
 # --- 1. DEVICE-AGNOSTIC ENVIRONMENT & PATH RESOLUTION ---
 def resolve_environment():
-    """
-    Ensures the script runs in an environment with mutagen and finds
-    tools like yt-dlp and node across Apple Silicon, Intel Macs, and user dirs.
-    """
-    # Prepend common Mac binary directories to PATH for subprocesses
     extra_paths = [
         str(Path(sys.executable).parent),
-        "/opt/homebrew/bin",                    # Apple Silicon Homebrew
-        "/usr/local/bin",                       # Intel Mac Homebrew
-        str(Path.home() / ".local/bin"),        # User local bin
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(Path.home() / ".local/bin"),
     ]
     current_path = os.environ.get("PATH", "")
     for p in reversed(extra_paths):
@@ -22,14 +17,12 @@ def resolve_environment():
             current_path = f"{p}:{current_path}"
     os.environ["PATH"] = current_path
 
-    # Check if mutagen is available in current interpreter
     try:
         import mutagen
         return
     except ImportError:
         pass
 
-    # If mutagen is missing, try to auto-relaunch using yt-mirror-env across known Mac paths
     candidate_envs = [
         Path.home() / "anaconda3/envs/yt-mirror-env/bin/python",
         Path.home() / "miniconda3/envs/yt-mirror-env/bin/python",
@@ -43,7 +36,6 @@ def resolve_environment():
 
     for env_python in candidate_envs:
         if env_python.is_file() and os.access(env_python, os.X_OK):
-            # Relaunch the script using the found conda environment
             os.execv(str(env_python), [str(env_python)] + sys.argv)
 
     print("Error: 'mutagen' library not found and 'yt-mirror-env' could not be auto-detected.", file=sys.stderr)
@@ -58,13 +50,16 @@ import sqlite3
 import re
 import subprocess
 import json
+import datetime
 import unicodedata
 from mutagen import File
+from mutagen.easyid3 import EasyID3
 
 # -------- CONFIG --------
 SCRIPT_DIR = Path(__file__).resolve().parent
-DATA_DIR = SCRIPT_DIR / ".data" if (SCRIPT_DIR / ".data").exists() else Path(".data")
+DATA_DIR = SCRIPT_DIR / ".data"
 DB_PATH = DATA_DIR / "metadata.db"
+MANIFEST_PATH = DATA_DIR / "export_manifest.json"
 
 MUSIC_ROOT = Path.home() / "Music"
 EXPORT_ROOT = Path.home() / "Downloads" / "AndroidExport"
@@ -72,21 +67,17 @@ PLAYLISTS_ONLY_ROOT = Path.home() / "Downloads" / "AndroidExport_Playlists"
 
 
 def find_ytdlp_binary():
-    """Locates yt-dlp across Conda, Homebrew (Apple Silicon & Intel), or PATH."""
     if "YTDLP_BIN" in os.environ and shutil.which(os.environ["YTDLP_BIN"]):
         return os.environ["YTDLP_BIN"]
 
-    # 1. Look in the same bin/ dir as current Python
     sibling = Path(sys.executable).parent / "yt-dlp"
     if sibling.is_file() and os.access(sibling, os.X_OK):
         return str(sibling)
 
-    # 2. Check system PATH
     found = shutil.which("yt-dlp")
     if found:
         return found
 
-    # 3. Common Mac package manager locations
     fallback_locs = [
         Path("/opt/homebrew/bin/yt-dlp"),
         Path("/usr/local/bin/yt-dlp"),
@@ -101,14 +92,47 @@ def find_ytdlp_binary():
     return "yt-dlp"
 
 YTDLP_BIN = find_ytdlp_binary()
-# ------------------------
 
 
+# --- 3. PERSISTENT LEDGER (MANIFEST) ---
+def load_manifest():
+    default_manifest = {"playlists": {}}
+    if not MANIFEST_PATH.exists():
+        return default_manifest
+    
+    try:
+        with open(MANIFEST_PATH, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+            if "playlists" not in manifest:
+                manifest["playlists"] = {}
+            return manifest
+    except Exception as e:
+        print(f"Warning: Could not read manifest ({e}). Starting fresh.")
+        return default_manifest
+
+
+def save_manifest(manifest):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(MANIFEST_PATH, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Warning: Could not save export manifest: {e}", file=sys.stderr)
+
+
+# --- 4. UTILITIES ---
 def get_safe_filename(original_stem, vid):
-    ascii_name = unicodedata.normalize('NFKD', original_stem).encode('ascii', 'ignore').decode('utf-8')
-    safe = re.sub(r'[^a-zA-Z0-9\s\-_]', '', ascii_name).strip()
+    clean = unicodedata.normalize('NFC', original_stem)
+    safe = re.sub(r'[\\/*?:"<>|]', '_', clean)
+    safe = "".join(ch for ch in safe if unicodedata.category(ch)[0] != "C")
+    safe = re.sub(r'\s+', ' ', safe).strip('. ')
+
     if len(safe) < 1:
         safe = f"track_{vid}"
+
+    if len(safe) > 200:
+        safe = safe[:200].strip('. ')
+
     return safe
 
 
@@ -124,30 +148,9 @@ def list_playlists(conn):
     return cur.fetchall()
 
 
-def get_active_playlist_vids_ordered(conn, playlist_id):
-    """
-    Fetches video IDs ordered by the timestamp they were added to the DB (v.added_at).
-    This matches the schema defined in yt-mirror-sync.
-    """
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT pv.video_id 
-        FROM playlist_videos pv
-        JOIN videos v ON pv.video_id = v.video_id
-        WHERE pv.playlist_id = ?
-        ORDER BY v.added_at ASC, pv.rowid ASC
-    ''', (playlist_id,))
-    return [row[0] for row in cur.fetchall()]
-
-
 def fetch_live_youtube_order(url):
-    """
-    Fetches the live playlist order from YouTube using yt-dlp.
-    Uses '--js-runtimes node' exactly like yt-mirror-sync to bypass bot blocks.
-    Returns list of video IDs on success, or None on failure.
-    """
     print("  Fetching live playlist order from YouTube...")
-    cmd = [YTDLP_BIN, '--js-runtimes', 'node', '--flat-playlist', '-J', url]
+    cmd = [YTDLP_BIN, '--js-runtimes', 'node', '--remote-components', 'ejs:github', '--flat-playlist', '-J', url]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
         data = json.loads(proc.stdout)
@@ -166,103 +169,107 @@ def scan_music_library():
 
     for root, _, files in os.walk(MUSIC_ROOT):
         for file in files:
-            if file.startswith("._"):
+            if file.startswith("._") or not file.lower().endswith((".mp3", ".m4a", ".flac")):
                 continue
                 
-            if file.lower().endswith((".mp3", ".m4a", ".flac")):
-                path = Path(root) / file
+            path = Path(root) / file
+            try:
+                # 1. EasyID3 (matches yt-mirror-sync)
                 try:
-                    audio = File(path)
-                    # EasyID3['isrc'] writes to the TSRC ID3 frame
-                    if audio and "TSRC" in audio:
-                        isrc = str(audio["TSRC"][0])
-                        isrc_map[isrc] = path
+                    audio = EasyID3(path)
+                    if "isrc" in audio and audio["isrc"]:
+                        isrc_map[str(audio["isrc"][0])] = path
+                        continue
                 except Exception:
                     pass
+
+                # 2. Raw ID3 TSRC fallback
+                audio = File(path)
+                if audio and "TSRC" in audio:
+                    isrc_map[str(audio["TSRC"][0])] = path
+            except Exception:
+                pass
 
     print(f"Found {len(isrc_map)} tracks with ISRC tags.\n")
     return isrc_map
 
 
-def export_playlist(conn, playlist_id, playlist_name, playlist_url, isrc_map, playlists_only=False):
-    print(f"\nExporting: {playlist_name} {'(.m3u only)' if playlists_only else ''}")
+# --- 5. CORE EXPORT ROUTINE ---
+def export_playlist(playlist_id, playlist_name, playlist_url, isrc_map, manifest, playlists_only=False):
+    str_pid = str(playlist_id)
+    history = manifest["playlists"].get(str_pid, {})
+    previous_tracks = history.get("tracks", {})
+    is_first_init = len(previous_tracks) == 0
 
-    db_vids_ordered = get_active_playlist_vids_ordered(conn, playlist_id)
-    if not db_vids_ordered:
-        print("  No videos found in database for this playlist.")
-        return
+    mode_label = ".m3u only" if playlists_only else ("INITIAL EXPORT (Full)" if is_first_init else "INCREMENTAL (New Only)")
+    print(f"\nExporting: {playlist_name} [{mode_label}]")
 
-    # 1. Fetch live order from YouTube. Abort on failure to protect playlist integrity.
+    # 1. Fetch live order from YouTube (Enforces Internet Connection)
     live_youtube_ids = fetch_live_youtube_order(playlist_url)
     if live_youtube_ids is None:
-        print(f"  [ABORT] Export cancelled for '{playlist_name}'. Internet down or invalid playlist.")
+        print(f"\n  [ABORT] Could not connect to YouTube.")
+        print(f"  Please check your internet connection to export '{playlist_name}'.")
         return
 
-    db_vids_set = set(db_vids_ordered)
-
-    # 2. Add available tracks in current live YouTube order
+    # Deduplicate while strictly maintaining live YouTube sequence
     valid_video_ids = []
     seen = set()
     for vid in live_youtube_ids:
-        if vid in db_vids_set and vid not in seen:
+        if vid not in seen:
             valid_video_ids.append(vid)
             seen.add(vid)
 
-    # 3. Preserve privated/hidden/deleted songs in their original relative positions
-    orphans = [vid for vid in db_vids_ordered if vid not in seen]
-    if orphans:
-        for orphan_vid in orphans:
-            idx_in_db = db_vids_ordered.index(orphan_vid)
-            
-            # Find the closest preceding track in the DB that exists in valid_video_ids
-            inserted = False
-            for prev_idx in range(idx_in_db - 1, -1, -1):
-                prev_vid = db_vids_ordered[prev_idx]
-                if prev_vid in valid_video_ids:
-                    target_pos = valid_video_ids.index(prev_vid) + 1
-                    valid_video_ids.insert(target_pos, orphan_vid)
-                    inserted = True
-                    break
-            
-            if not inserted:
-                valid_video_ids.insert(0, orphan_vid)
-
-        print(f"  Note: Preserved {len(orphans)} privated/hidden tracks in relative positions.")
-
-    # 4. Resolve destination path (both modes create subfolders per playlist)
+    # 2. Target export directory
     safe_playlist_name = clean_playlist_name(playlist_name)
     base_root = PLAYLISTS_ONLY_ROOT if playlists_only else EXPORT_ROOT
     export_dir = base_root / safe_playlist_name
     export_dir.mkdir(parents=True, exist_ok=True)
 
+    # 3. Check for deleted tracks since last export
+    current_valid_set = set(valid_video_ids)
+    deleted_vids = [vid for vid in previous_tracks.keys() if vid not in current_valid_set]
+    if deleted_vids:
+        print("\n" + "!" * 60)
+        print("  ⚠️ SONGS REMOVED FROM PLAYLIST:")
+        print("  Delete these files manually from your Android phone:")
+        for vid in deleted_vids:
+            old_filename = previous_tracks[vid]
+            print(f"    - {old_filename}")
+        print("!" * 60 + "\n")
+
     m3u_tracks = []
     matched = 0
+    copied_count = 0
+    skipped_count = 0
     missing_details = []
+    current_exported_tracks = {}
 
-    # 5. Process files
+    # 4. Process files directly from local storage matching live YouTube order
     for vid in valid_video_ids:
         if vid in isrc_map:
             src = isrc_map[vid]
             safe_stem = get_safe_filename(src.stem, vid)
             safe_song_name = f"{safe_stem}{src.suffix}"
+            current_exported_tracks[vid] = safe_song_name
 
-            # Only copy audio files if NOT in playlist-only mode
             if not playlists_only:
                 dst = export_dir / safe_song_name
-                if not dst.exists():
+                
+                # Copy only if track has not been exported in a previous session
+                if vid not in previous_tracks:
                     shutil.copyfile(src, dst)
+                    copied_count += 1
+                else:
+                    skipped_count += 1
 
+            # Natural title for Samsung Music display label (preserves slashes/colons)
             display_name = unicodedata.normalize('NFC', src.stem)
             m3u_tracks.append((display_name, safe_song_name))
             matched += 1
         else:
-            cur = conn.cursor()
-            cur.execute("SELECT title FROM videos WHERE video_id = ?", (vid,))
-            row = cur.fetchone()
-            song_title = row[0] if row else f"Unknown YouTube ID ({vid})"
-            missing_details.append(song_title)
+            missing_details.append(f"https://youtu.be/{vid}")
 
-    # 6. Write M3U file (utf-8-sig and CRLF for Samsung Music compatibility)
+    # 5. Write complete M3U playlist file (UTF-8 BOM + CRLF for Samsung Music)
     m3u_path = export_dir / f"{safe_playlist_name}.m3u"
     with open(m3u_path, "w", encoding="utf-8-sig", newline='\r\n') as f:
         f.write("#EXTM3U\n")
@@ -270,10 +277,23 @@ def export_playlist(conn, playlist_id, playlist_name, playlist_url, isrc_map, pl
             f.write(f"#EXTINF:-1,{track_name}\n")
             f.write(f"{file_name}\n")
 
+    # 6. Commit to manifest ledger
+    if not playlists_only:
+        manifest["playlists"][str_pid] = {
+            "name": playlist_name,
+            "last_exported": datetime.datetime.now().isoformat(),
+            "tracks": current_exported_tracks
+        }
+        save_manifest(manifest)
+
+    # 7. Summary
     if playlists_only:
         print(f"  Created: {safe_playlist_name}/{m3u_path.name} ({matched} tracks)")
     else:
-        print(f"  Exported/Matched: {matched}")
+        print(f"  Total Tracks in Playlist: {matched}")
+        print(f"  -> Newly Exported Files:  {copied_count} (Transfer to Android)")
+        print(f"  -> Already on Android:    {skipped_count} (Skipped)")
+        print(f"  -> Full .m3u Playlist:    {m3u_path.name} (Overwrite on Android)")
 
     if missing_details:
         print(f"  Missing from Mac Hard Drive: {len(missing_details)}")
@@ -282,6 +302,7 @@ def export_playlist(conn, playlist_id, playlist_name, playlist_url, isrc_map, pl
     print("  Done.")
 
 
+# --- 6. USER INTERFACE ---
 def main():
     if not DB_PATH.exists():
         print(f"Error: Database file not found at {DB_PATH}")
@@ -295,20 +316,26 @@ def main():
         conn.close()
         return
 
+    manifest = load_manifest()
     isrc_map = scan_music_library()
 
     try:
         while True:
-            print("=" * 45)
+            print("=" * 55)
             print("Playlists:")
-            for idx, (_, name, _) in enumerate(playlists, 1):
-                print(f"  [{idx}] {name}")
-            print("  [A] Export ALL (Songs + .m3u)")
+            for idx, (pid, name, _) in enumerate(playlists, 1):
+                tracked_count = len(manifest["playlists"].get(str(pid), {}).get("tracks", {}))
+                status = f"{tracked_count} synced" if tracked_count > 0 else "New"
+                print(f"  [{idx}] {name} ({status})")
+            
+            print("\nActions:")
+            print("  [A] Export ALL (Audio + .m3u)")
             print("  [P] Export ALL Playlists ONLY (.m3u only)")
+            print("  [R] Reset Export History")
             print("  [Q] Quit")
-            print("=" * 45)
+            print("=" * 55)
 
-            choice = input("\nSelect option (e.g. 1, 4, 2, A or P): ").strip()
+            choice = input("\nSelect playlist(s) (e.g. 1, 3, 5) or command [A, P, R, Q]: ").strip()
 
             if not choice:
                 continue
@@ -316,13 +343,41 @@ def main():
             if choice.lower() == 'q':
                 break
 
+            if choice.lower() == 'r':
+                target = input("Enter playlist number(s) to reset (e.g. 1, 3 or 'all'): ").strip()
+                if target.lower() == 'all':
+                    manifest["playlists"] = {}
+                    save_manifest(manifest)
+                    print("\n  -> Reset export history for ALL playlists.")
+                else:
+                    tokens = [t.strip() for t in target.split(",") if t.strip()]
+                    reset_count = 0
+                    for token in tokens:
+                        try:
+                            idx = int(token) - 1
+                            if 0 <= idx < len(playlists):
+                                pid_to_reset = str(playlists[idx][0])
+                                if pid_to_reset in manifest["playlists"]:
+                                    del manifest["playlists"][pid_to_reset]
+                                    print(f"  -> Reset history for '{playlists[idx][1]}'.")
+                                    reset_count += 1
+                                else:
+                                    print(f"  -> '{playlists[idx][1]}' has no prior history.")
+                            else:
+                                print(f"  -> Number [{token}] is out of range.")
+                        except ValueError:
+                            print(f"  -> '{token}' is not a valid number.")
+                    if reset_count > 0:
+                        save_manifest(manifest)
+                continue
+
             if choice.lower() == 'p':
                 print(f"\nExporting all .m3u files to: {PLAYLISTS_ONLY_ROOT}")
                 for pid, name, url in playlists:
-                    export_playlist(conn, pid, name, url, isrc_map, playlists_only=True)
+                    export_playlist(pid, name, url, isrc_map, manifest, playlists_only=True)
             elif choice.lower() == 'a':
                 for pid, name, url in playlists:
-                    export_playlist(conn, pid, name, url, isrc_map, playlists_only=False)
+                    export_playlist(pid, name, url, isrc_map, manifest, playlists_only=False)
             else:
                 tokens = [t.strip() for t in choice.split(",") if t.strip()]
                 selected_indices = []
@@ -344,7 +399,7 @@ def main():
 
                 for idx in selected_indices:
                     pid, name, url = playlists[idx]
-                    export_playlist(conn, pid, name, url, isrc_map, playlists_only=False)
+                    export_playlist(pid, name, url, isrc_map, manifest, playlists_only=False)
 
             again = input("\nDo you want to export more? [y/N]: ").strip().lower()
             if again not in ('y', 'yes'):
@@ -353,6 +408,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\nOperation cancelled by user.")
     finally:
+        save_manifest(manifest)
         conn.close()
 
     print("\nAll done. Goodbye!")
