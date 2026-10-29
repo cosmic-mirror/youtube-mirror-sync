@@ -24,24 +24,50 @@ import sys
 import sqlite3
 import subprocess
 import json
-import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import textwrap
 import re
 import shutil
 import time
+import tempfile
 from typing import Optional, List, Dict, Tuple
 
 try:
     from mutagen.easyid3 import EasyID3, EasyID3KeyError
-    from mutagen.id3 import ID3NoHeaderError
+    from mutagen.id3 import ID3, APIC, ID3NoHeaderError
 except ImportError:
     print("Error: 'mutagen' library not found. The launcher script should install it.", file=sys.stderr)
     sys.exit(1)
 
 # ---------------------------------------------------------------------
-# 1. UTILITY FUNCTIONS
+# 1. UTILITY FUNCTIONS & COLOR LOGGING
 # ---------------------------------------------------------------------
+
+class Log:
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    CYAN = "\033[96m"
+    RESET = "\033[0m"
+
+    @classmethod
+    def _colorize(cls, text: str, color: str, stream) -> str:
+        if hasattr(stream, "isatty") and stream.isatty():
+            return f"{color}{text}{cls.RESET}"
+        return text
+
+    @classmethod
+    def warn(cls, msg: str):
+        print(cls._colorize(f"  -> [WARN] {msg}", cls.YELLOW, sys.stderr), file=sys.stderr)
+
+    @classmethod
+    def error(cls, msg: str):
+        print(cls._colorize(f"  -> [ERROR] {msg}", cls.RED, sys.stderr), file=sys.stderr)
+
+    @classmethod
+    def note(cls, msg: str):
+        print(cls._colorize(f"  -> [NOTE] {msg}", cls.CYAN, sys.stdout))
+
 
 JUNK_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
     r'\(official music video\)', r'\[official music video\]', r'\(official video\)',
@@ -54,7 +80,7 @@ def _run_command(cmd: List[str], capture_output: bool = True, text: bool = True,
     try:
         return subprocess.run(cmd, capture_output=capture_output, text=text, check=check)
     except FileNotFoundError:
-        print(f"Error: Command not found: {cmd[0]}. Please install it and ensure it's on PATH.", file=sys.stderr)
+        Log.error(f"Command not found: {cmd[0]}. Please ensure it is on your PATH.")
         sys.exit(127)
 
 def _clean_youtube_title(title: str, artist: str) -> str:
@@ -69,11 +95,18 @@ def _clean_youtube_title(title: str, artist: str) -> str:
 def _clean_artist_name(artist: str) -> str:
     return re.sub(r'\s-\sTopic$', '', artist, flags=re.IGNORECASE).strip()
 
+JUNK_PLACEHOLDERS = {
+    '[private video]', '[deleted video]', '[unavailable video]', 
+    'private video', 'deleted video', 'unavailable', 'none', 'na'
+}
+
 def resolve_metadata(raw_title: str, raw_artist: str) -> Tuple[str, str]:
-    artist = raw_artist if raw_artist and raw_artist.lower() != "unknown" else ""
+    if not raw_title or raw_title.strip().lower() in JUNK_PLACEHOLDERS:
+        return "Unknown Artist", "Unknown Title"
+
+    artist = raw_artist if raw_artist and raw_artist.lower() not in ["", "unknown", "none", "na"] else ""
     title = raw_title
     
-    # If no valid artist was provided, see if the title contains "Artist - Title"
     if not artist and " - " in raw_title:
         parts = raw_title.split(" - ", 1)
         artist = parts[0].strip()
@@ -107,13 +140,16 @@ class Config:
     STAGING_DIR: Path = APP_DIR / 'staging'
     
     YTDLP_BIN: str = os.environ.get('YTDLP_BIN', 'yt-dlp')
+    FFMPEG_BIN: str = os.environ.get('FFMPEG_BIN', 'ffmpeg')
     AUDIO_FORMAT: str = 'mp3'
+    ARTWORK_SIZE: int = 600
+    EMBED_ARTWORK: bool = True
 
     DEFAULT_TARGET_DIR: Path = Path.home() / 'Music/Music/Media.localized/Automatically Add to Music.localized'
     MUSIC_LIBRARY_ROOT: Path = Path.home() / 'Music/Music/Media.localized'
     MUSIC_LIBRARY_DB_PATH: Path = Path.home() / 'Music/Music/Music Library.musiclibrary'
     
-    ALBUM_MODE: str = 'global'
+    ALBUM_MODE: str = 'playlist'
     GLOBAL_ALBUM_NAME: str = 'YouTube Downloads'
     DEFAULT_DELETE_ON_REMOVED: bool = True
 
@@ -175,7 +211,7 @@ class DatabaseManager:
         return cur.fetchone() is not None
 
     def add_playlist(self, name: str, url: str, archive_path: str, delete_on_removed: bool):
-        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self._conn:
             self._conn.execute('INSERT INTO playlists (name, url, archive_path, delete_on_removed, created_at, music_app_persistent_id) VALUES (?, ?, ?, ?, ?, ?)',
                         (name, url, archive_path, int(delete_on_removed), now, None))
@@ -189,7 +225,7 @@ class DatabaseManager:
             self._conn.execute("UPDATE playlists SET name = ? WHERE id = ?", (new_name, playlist_id))
 
     def insert_or_update_video(self, video_id: str, title: str):
-        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self._conn:
             self._conn.execute('''
                 INSERT INTO videos (video_id, title, added_at) 
@@ -234,7 +270,7 @@ class DatabaseManager:
         return cur.fetchone()
 
     def record_failure(self, video_id: str, reason: str = ""):
-        now = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         row = self.get_failure_status(video_id)
         with self._conn:
             if row:
@@ -286,7 +322,6 @@ class MusicAppClient:
                 if foundPlaylist is missing value then
                     set foundPlaylist to make new user playlist with properties {name:playlistName}
                 else
-                    -- Enforce name update in case it was renamed in the script
                     set name of foundPlaylist to playlistName
                 end if
                 delete every track of foundPlaylist
@@ -308,7 +343,7 @@ class MusicAppClient:
             output_parts = result.stdout.strip().split(', ')
             if len(output_parts) == 2: return output_parts[0], output_parts[1]
         
-        print(f"  -> Warning: AppleScript for playlist '{playlist_name}' may have failed. Error: {result.stderr.strip()}", file=sys.stderr)
+        Log.warn(f"AppleScript for playlist '{playlist_name}' issue: {result.stderr.strip()[:100]}")
         return persistent_id or "", playlist_name
         
     def wait_for_import(self, expected_new_count: int, count_before_add: int):
@@ -317,7 +352,7 @@ class MusicAppClient:
         target_count = count_before_add + expected_new_count
         last_track_count = -1
         stable_checks = 0
-        max_retries = 60 # Prevent infinite loops
+        max_retries = 60
         attempts = 0
         
         while attempts < max_retries:
@@ -337,7 +372,7 @@ class MusicAppClient:
                 print("   - Music.app appears to have finished importing.")
                 return
             last_track_count = current_track_count
-        print("   -> Warning: Music.app import wait timed out. Proceeding anyway.", file=sys.stderr)
+        Log.warn("Music.app import wait timed out. Proceeding anyway.")
 
     def clean_dead_tracks(self):
         if sys.platform != "darwin": return
@@ -356,7 +391,7 @@ class MusicAppClient:
         """
         result = self._run_applescript(script)
         if result.returncode == 0: print(f"  -> {result.stdout.strip()}")
-        else: print(f"  -> Warning: AppleScript cleanup failed. Error: {result.stderr.strip()}", file=sys.stderr)
+        else: Log.warn(f"Dead track cleanup failed: {result.stderr.strip()[:100]}")
 
     def rebuild_library(self, library_db_path: Path, media_folder_to_import: Path) -> bool:
         if sys.platform != "darwin": return False
@@ -369,7 +404,8 @@ class MusicAppClient:
                 shutil.rmtree(library_db_path)
                 print(f"   - '{library_db_path.name}' deleted successfully.")
             except Exception as e:
-                print(f"\n  -> ERROR: {e}", file=sys.stderr); return False
+                Log.error(f"Failed deleting library DB: {e}")
+                return False
         print("3. Relaunching Music.app to create a new, empty library...")
         self._run_applescript('tell application "Music" to activate')
         time.sleep(5)
@@ -383,7 +419,7 @@ class YouTubeClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.temp_output_template = str(self.cfg.STAGING_DIR / '%(id)s.%(ext)s')
-        self.base_cmd = [self.cfg.YTDLP_BIN, '--js-runtimes', 'node']
+        self.base_cmd = [self.cfg.YTDLP_BIN, '--js-runtimes', 'node', '--remote-components', 'ejs:github']
 
     def fetch_playlist_metadata(self, url: str) -> Optional[List[Dict]]:
         cmd = self.base_cmd + ['--flat-playlist', '-J', url]
@@ -396,7 +432,6 @@ class YouTubeClient:
                 if not e.get('id'):
                     continue
                 
-                # Defensively search for a valid artist name, skipping generic "Unknown" fallbacks
                 artist = ""
                 for key in ['artist', 'creator', 'channel', 'uploader']:
                     val = e.get(key)
@@ -412,7 +447,6 @@ class YouTubeClient:
             return results
         except (json.JSONDecodeError, AttributeError): return None
 
-    
     def fetch_playlist_title(self, url: str) -> Optional[str]:
         cmd = self.base_cmd + ['--flat-playlist', '-J', url]
         proc = _run_command(cmd)
@@ -420,15 +454,25 @@ class YouTubeClient:
         try: return json.loads(proc.stdout).get('title')
         except (json.JSONDecodeError, AttributeError): return None
 
-    def download_video(self, video_id: str, archive_path: Path) -> Optional[Path]:
+    def download_video(self, video_id: str, archive_path: Path, thumb_dir: Optional[Path] = None) -> Optional[Path]:
         video_url = f'https://youtu.be/{video_id}'
         cmd = self.base_cmd + [
             '-f', 'bestaudio', '--extract-audio', '--audio-format', self.cfg.AUDIO_FORMAT,
             '--output', self.temp_output_template, '--ignore-errors', '--no-playlist', 
-            '--download-archive', str(archive_path), video_url
+            '--download-archive', str(archive_path)
         ]
+        if thumb_dir:
+            cmd.extend([
+                '--write-thumbnail',
+                '--output', f'thumbnail:{thumb_dir}/thumb.%(ext)s'
+            ])
+        cmd.append(video_url)
         _run_command(cmd, capture_output=False)
-        return next(self.cfg.STAGING_DIR.glob(f'{video_id}.*'), None)
+
+        expected_audio_path = self.cfg.STAGING_DIR / f'{video_id}.{self.cfg.AUDIO_FORMAT}'
+        if expected_audio_path.is_file() and expected_audio_path.stat().st_size > 0:
+            return expected_audio_path
+        return None
 
 # ---------------------------------------------------------------------
 # 4. CORE APPLICATION LOGIC
@@ -462,8 +506,8 @@ class LibraryScanner:
         return self.isrc_cache.get(video_id)
 
 class SyncOrchestrator:
-    BACKOFF_BASE_SECONDS = 86400  # 1 Day
-    BACKOFF_MAX_SECONDS = 2592000 # 30 Days
+    BACKOFF_BASE_SECONDS = 86400
+    BACKOFF_MAX_SECONDS = 2592000
 
     def __init__(self, cfg: Config, db: DatabaseManager, music_app: MusicAppClient, yt: YouTubeClient, scanner: LibraryScanner):
         self.cfg = cfg
@@ -500,10 +544,76 @@ class SyncOrchestrator:
                 if 'album' in audio: del audio['album']
                 if 'compilation' in audio: del audio['compilation']
                 audio['albumartist'] = artist
-            audio.save(file_path)
+            audio.save(file_path, v2_version=3)
             print(f"  -> Wrote metadata to '{file_path.name}'.")
         except Exception as e:
-            print(f"  -> Warning: Could not write metadata to '{file_path.name}': {e}", file=sys.stderr)
+            Log.warn(f"Could not write metadata to '{file_path.name}': {e}")
+
+    def _process_artwork_image(self, input_img: Path, output_jpeg: Path) -> bool:
+        cmd = [
+            self.cfg.FFMPEG_BIN, '-y',
+            '-i', str(input_img),
+            '-vf', f'scale={self.cfg.ARTWORK_SIZE}:{self.cfg.ARTWORK_SIZE}:force_original_aspect_ratio=increase,crop={self.cfg.ARTWORK_SIZE}:{self.cfg.ARTWORK_SIZE}',
+            '-q:v', '2',
+            str(output_jpeg)
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if res.returncode != 0:
+                Log.warn(f"FFmpeg conversion failed: {res.stderr.strip()[:80]}")
+                return False
+            return output_jpeg.is_file() and output_jpeg.stat().st_size > 0
+        except FileNotFoundError:
+            Log.warn(f"FFmpeg binary not found at '{self.cfg.FFMPEG_BIN}'. Skipping artwork.")
+            return False
+        except Exception as e:
+            Log.warn(f"FFmpeg error: {e}")
+            return False
+
+    def _embed_artwork_safely(self, audio_file: Path, jpeg_path: Path) -> bool:
+        if not jpeg_path.is_file() or jpeg_path.stat().st_size == 0:
+            return False
+
+        candidate_path = audio_file.with_name(f"{audio_file.stem}.candidate{audio_file.suffix}")
+        try:
+            shutil.copy2(audio_file, candidate_path)
+
+            jpeg_data = jpeg_path.read_bytes()
+            try:
+                tags = ID3(candidate_path)
+            except ID3NoHeaderError:
+                tags = ID3()
+
+            tags.delall('APIC')
+            tags.add(
+                APIC(
+                    encoding=0,
+                    mime='image/jpeg',
+                    type=3,
+                    desc='',
+                    data=jpeg_data
+                )
+            )
+            tags.save(candidate_path, v2_version=3)
+
+            # Strict validation
+            validated_tags = ID3(candidate_path)
+            apic_frames = validated_tags.getall('APIC')
+            if not apic_frames:
+                raise ValueError("APIC frame missing in candidate file")
+            apic = apic_frames[0]
+            if apic.type != 3 or apic.mime != 'image/jpeg' or len(apic.data) == 0:
+                raise ValueError("APIC frame validation failed in candidate file")
+
+            candidate_path.replace(audio_file)
+            return True
+        except Exception as e:
+            Log.warn(f"Artwork embedding failed ({e}). Keeping original audio.")
+            return False
+        finally:
+            if candidate_path.exists():
+                try: candidate_path.unlink()
+                except OSError: pass
 
     def _remove_from_archive(self, video_id: str, archive_path: Path):
         if not archive_path.exists(): return
@@ -512,26 +622,30 @@ class SyncOrchestrator:
             updated_lines = [line for line in lines if line.strip() != f"youtube {video_id}"]
             if len(lines) != len(updated_lines):
                 with open(archive_path, 'w') as f: f.writelines(updated_lines)
-        except Exception as e: pass
+        except Exception: pass
 
     def _is_cooling_down(self, video_id: str) -> bool:
         row = self.db.get_failure_status(video_id)
         if not row: return False
 
         failures = row['failure_count']
-        try: last_attempt = datetime.datetime.strptime(row['last_attempt_at'], "%Y-%m-%dT%H:%M:%SZ")
-        except ValueError: return False
+        try:
+            last_attempt = datetime.strptime(
+                row['last_attempt_at'], "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False
 
         exponent = max(0, failures - 1)
         delay_seconds = min(self.BACKOFF_BASE_SECONDS * (2 ** exponent), self.BACKOFF_MAX_SECONDS)
         
-        next_retry = last_attempt + datetime.timedelta(seconds=delay_seconds)
-        now = datetime.datetime.utcnow()
+        next_retry = last_attempt + timedelta(seconds=delay_seconds)
+        now = datetime.now(timezone.utc)
         
         if now < next_retry:
             wait_time = next_retry - now
-            time_str = f"{wait_time.days} day(s)" if wait_time.days > 0 else f"{wait_time.seconds // 3600} hour(s)" if wait_time.seconds >= 3600 else f"{wait_time.seconds // 60} minute(s)"
-            print(f"  -> Skipping '{video_id}' (Circuit Open). Failures: {failures}. Next retry in {time_str}.")
+            time_str = f"{wait_time.days}d" if wait_time.days > 0 else f"{wait_time.seconds // 3600}h" if wait_time.seconds >= 3600 else f"{wait_time.seconds // 60}m"
+            Log.warn(f"Skipping '{video_id}' (Circuit Open). Failures: {failures}. Retry in {time_str}.")
             return True
         return False
 
@@ -548,20 +662,21 @@ class SyncOrchestrator:
         else: print("  -> No new files to adopt.")
 
     def sync_playlist(self, playlist_id: int):
-        self.scanner.scan(force_rescan=True) # Always start fresh in case Apple Music moved files
+        self.scanner.scan(force_rescan=True)
         playlist = self.db.get_playlist_details(playlist_id)
         if not playlist: return
 
         ordered_vids_for_playlist = []
         new_files_staged = []
-        metadata_updated = False # Track if we changed any tags
+        metadata_updated = False
         
         try:
             print(f'\n=== Syncing [{playlist["id"]}] {playlist["name"]} ===')
             print("Step 1/3: Fetching latest video list from YouTube...")
             upstream_videos = self.youtube.fetch_playlist_metadata(playlist['url'])
             if upstream_videos is None:
-                print('  -> Failed to fetch playlist metadata. Aborting sync.', file=sys.stderr); return
+                Log.error(f"Failed to fetch metadata for playlist '{playlist['name']}'. Aborting sync.")
+                return
 
             album_name = playlist['name'] if self.cfg.ALBUM_MODE == 'playlist' else self.cfg.GLOBAL_ALBUM_NAME
 
@@ -575,30 +690,38 @@ class SyncOrchestrator:
 
                 # Check if it exists ANYWHERE in the library by its ID
                 if file_path and file_path.exists():
-                    self.db.insert_or_update_video(vid, title)
                     current_tags = self._get_tags(file_path)
                     
-                    # SAFETY SHIELD: If fast-scan gave us "Unknown Artist", but the file on disk
-                    # already has a valid creator name, protect your disk tags and use them!
+                    junk_placeholders = {
+                        '[private video]', '[deleted video]', '[unavailable video]',
+                        'private video', 'deleted video', 'unavailable', 'unknown title', 
+                        'unknown artist', 'unknown', 'na', 'none', vid.lower()
+                    }
+
+                    final_title = title
+                    if not title or title.strip().lower() in junk_placeholders:
+                        disk_title = current_tags.get('title')
+                        if disk_title and disk_title.strip().lower() not in junk_placeholders:
+                            final_title = disk_title
+
                     final_artist = artist
-                    if artist == "Unknown Artist":
+                    if not artist or artist.strip().lower() in junk_placeholders:
                         disk_artist = current_tags.get('artist')
-                        if disk_artist and disk_artist.lower() not in ['', 'unknown', 'unknown artist', 'unknown uploader']:
+                        if disk_artist and disk_artist.strip().lower() not in junk_placeholders:
                             final_artist = disk_artist
 
-                    # Determine what the tags SHOULD be based on your config
+                    self.db.insert_or_update_video(vid, final_title)
                     expected_album = album_name if album_name else ""
 
-                    # Check if any core tag is out of sync (comparing against our protected final_artist)
                     needs_update = (
-                        current_tags.get('title') != title or
+                        current_tags.get('title') != final_title or
                         current_tags.get('artist') != final_artist or
                         current_tags.get('album') != expected_album
                     )
                     
                     if needs_update:
-                        print(f"Metadata for '{title}' is outdated, fixing...")
-                        self._write_tags_to_file(file_path, vid, title, final_artist, album_name)
+                        print(f"Metadata for '{final_title}' is outdated, fixing...")
+                        self._write_tags_to_file(file_path, vid, final_title, final_artist, album_name)
                 
                 # File is completely missing
                 else:
@@ -606,18 +729,36 @@ class SyncOrchestrator:
                     
                     print(f"\nFile for '{artist} - {title}' is missing, downloading...")
                     self._remove_from_archive(vid, Path(playlist['archive_path']))
-                    staged_path = self.youtube.download_video(vid, Path(playlist['archive_path']))
                     
-                    if staged_path:
-                        self.db.clear_failure(vid)
-                        self._write_tags_to_file(staged_path, vid, title, artist, album_name)
-                        self.db.insert_or_update_video(vid, title)
-                        final_filename = f"{_sanitize_filename(artist)} - {_sanitize_filename(title)}.{self.cfg.AUDIO_FORMAT}"
-                        new_files_staged.append((staged_path, final_filename))
-                    else:
-                        print(f"  -> Download failed. Recording failure for exponential backoff.")
-                        self.db.record_failure(vid, reason="Download failed")
-                        continue # Skip adding this broken song to the playlist for now
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        tmp_thumb_dir = Path(tmp_dir)
+                        staged_path = self.youtube.download_video(vid, Path(playlist['archive_path']), thumb_dir=tmp_thumb_dir)
+                        
+                        if staged_path:
+                            self.db.clear_failure(vid)
+                            self._write_tags_to_file(staged_path, vid, title, artist, album_name)
+                            
+                            # Optional: artwork embedding (guaranteed non-fatal)
+                            if getattr(self.cfg, 'EMBED_ARTWORK', True):
+                                try:
+                                    raw_thumb = next(tmp_thumb_dir.glob("thumb.*"), None)
+                                    if raw_thumb and raw_thumb.is_file() and raw_thumb.stat().st_size > 0:
+                                        cover_jpg = tmp_thumb_dir / "cover.jpg"
+                                        if self._process_artwork_image(raw_thumb, cover_jpg):
+                                            if self._embed_artwork_safely(staged_path, cover_jpg):
+                                                print(f"  -> Embedded 600x600 artwork into '{staged_path.name}'.")
+                                    else:
+                                        Log.note(f"No thumbnail available for '{vid}'. Proceeding without artwork.")
+                                except Exception as e:
+                                    Log.warn(f"Artwork processing skipped for '{vid}' ({e}).")
+
+                            self.db.insert_or_update_video(vid, title)
+                            final_filename = f"{_sanitize_filename(artist)} - {_sanitize_filename(title)}.{self.cfg.AUDIO_FORMAT}"
+                            new_files_staged.append((staged_path, final_filename))
+                        else:
+                            Log.warn(f"Download failed for '{vid}'. Logged for exponential backoff.")
+                            self.db.record_failure(vid, reason="Download failed")
+                            continue
 
                 ordered_vids_for_playlist.append(vid)
                 self.db.link_video_to_playlist(playlist_id, vid)
@@ -632,8 +773,8 @@ class SyncOrchestrator:
                 self.scanner.scan(force_rescan=True)
             elif metadata_updated:
                 print("\nWaiting for Apple Music to reorganize updated files...")
-                time.sleep(3) # Give Apple Music time to move files
-                self.scanner.scan(force_rescan=True) # Refresh the cache with the new paths!
+                time.sleep(3)
+                self.scanner.scan(force_rescan=True)
             
             print("\nStep 3/3: Rebuilding playlist in Music.app to match YouTube order...")
             file_paths = [str(self.scanner.get_path_for_id(vid)) for vid in ordered_vids_for_playlist if self.scanner.get_path_for_id(vid)]
@@ -698,14 +839,15 @@ class SyncOrchestrator:
                     path_to_delete.unlink()
                     print(f"  - Deleted local file for '{orphan['title']}'")
                     files_were_deleted = True
-                except OSError as e: print(f"  - Error deleting file {path_to_delete}: {e}", file=sys.stderr)
+                except OSError as e: Log.warn(f"Error deleting file {path_to_delete.name}: {e}")
             self.db.delete_video_record(orphan['video_id'])
         
         if files_were_deleted: self.music_app.clean_dead_tracks()
 
     def rebuild_full_library(self) -> bool:
         if not self.music_app.rebuild_library(self.cfg.MUSIC_LIBRARY_DB_PATH, self.scanner.media_folder):
-            print("\nLibrary rebuild failed. Aborting subsequent sync.", file=sys.stderr); return False
+            Log.error("Library rebuild failed. Aborting subsequent sync.")
+            return False
         print("5. Resetting this script's internal state to match new library...")
         self.db.reset_all_persistent_ids()
         self.scanner.scan(force_rescan=True)
@@ -771,7 +913,8 @@ class ConsoleUI:
         
         playlist = self.db.get_playlist_details(pid)
         if not playlist:
-            print(f"Playlist with ID {pid} not found.", file=sys.stderr); return
+            Log.error(f"Playlist with ID {pid} not found.")
+            return
 
         print(f"Fetching current title from YouTube for '{playlist['url']}'...")
         suggested_title = self.youtube.fetch_playlist_title(playlist['url'])
